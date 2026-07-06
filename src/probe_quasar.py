@@ -26,6 +26,10 @@ def main() -> None:
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    # flat sibling imports in the checkpoint's modeling code need the dir on sys.path
+    if args.model_path not in sys.path:
+        sys.path.insert(0, args.model_path)
+
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path, dtype=torch.bfloat16, trust_remote_code=True,
@@ -35,13 +39,13 @@ def main() -> None:
           f"{sum(p.numel() for p in model.parameters()) / 1e9:.2f}B params")
 
     import chat_data
-    ds_type = json.loads(args.dataset_type)
-    rows = chat_data.load_rows(args.data_path, ds_type)
-    sample = chat_data.encode_conversation(rows[0], tokenizer, ds_type, 4096)
+    train_items, dev_items, stats = chat_data.prepare_dataset(
+        tokenizer, args.data_path, args.dataset_type, args.model_path, 4096)
+    sample = train_items[0]
     n_train_tokens = sum(1 for l in sample["labels"] if l != -100)
     assert n_train_tokens > 0, "masking produced no trainable tokens"
-    print(f"template/masking OK: {len(sample['input_ids'])} tokens, "
-          f"{n_train_tokens} trainable")
+    print(f"template/masking OK: {len(train_items)} train / {len(dev_items)} dev, "
+          f"sample: {len(sample['input_ids'])} tokens, {n_train_tokens} trainable")
 
     for p in model.parameters():
         p.requires_grad_(False)

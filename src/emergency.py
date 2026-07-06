@@ -4,6 +4,7 @@ base. Run under whichever python stack can load the architecture."""
 
 import argparse
 import os
+import sys
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -14,6 +15,9 @@ def main() -> None:
     ap.add_argument("--model-path", required=True)
     ap.add_argument("--output-dir", required=True)
     args = ap.parse_args()
+
+    if os.path.isdir(args.model_path) and args.model_path not in sys.path:
+        sys.path.insert(0, args.model_path)  # flat sibling imports in custom archs
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True)

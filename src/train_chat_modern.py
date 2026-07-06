@@ -329,6 +329,12 @@ def train(args):
     model_path = args.model
     log(f"[train] model={model_path} data={args.data_path} deadline_in={(end_ts - time.time())/60:.0f}min")
 
+    # Custom-arch checkpoints (quasar) import their sibling config module by
+    # absolute name; transformers only auto-resolves relative imports, so the
+    # checkpoint dir itself must be importable.
+    if os.path.isdir(model_path) and model_path not in sys.path:
+        sys.path.insert(0, model_path)
+
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token

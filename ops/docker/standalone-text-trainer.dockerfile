@@ -41,6 +41,7 @@ RUN python -m venv /opt/modern && \
 
 COPY src /workspace/src
 COPY ds_config /workspace/ds_config
+COPY ops/accelerate /workspace/ops/accelerate
 COPY ops/entrypoint.sh /workspace/entrypoint.sh
 RUN chmod +x /workspace/entrypoint.sh
 

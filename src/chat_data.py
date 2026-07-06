@@ -198,6 +198,84 @@ def _stable_hash(conversation):
     return int(hashlib.md5(payload).hexdigest()[:12], 16)
 
 
+def _instruct_prompt_text(row, dt):
+    """Build the prompt string the way axolotl's user-defined instruct type does."""
+    instruction = str(row.get(dt.get("field_instruction") or "instruction", "") or "")
+    input_field = dt.get("field_input")
+    input_text = str(row.get(input_field, "") or "") if input_field else ""
+
+    if input_text:
+        fmt = dt.get("format") or "{instruction} {input}"
+    else:
+        fmt = dt.get("no_input_format") or "{instruction}"
+    prompt = fmt.replace("{instruction}", instruction).replace("{input}", input_text)
+
+    system_text = ""
+    sys_field = dt.get("field_system")
+    if sys_field and row.get(sys_field):
+        system_text = str(row[sys_field])
+    elif dt.get("system_prompt"):
+        system_text = str(dt["system_prompt"])
+    if system_text:
+        sys_fmt = dt.get("system_format") or "{system}"
+        prompt = sys_fmt.replace("{system}", system_text) + prompt
+    return prompt
+
+
+def prepare_instruct_dataset(tokenizer, data_path, dataset_type_json, seq_len,
+                             dev_frac=0.02, dev_cap=200, log=print):
+    """InstructTextTask on a custom-arch model (the pre-boss quasar task).
+
+    Tokenization mirrors axolotl's instruct strategy — prompt and response are
+    tokenized separately and concatenated (NOT joint tokenization), response
+    gets a trailing eos, prompt tokens are masked — because the validator's
+    eval tokenizes the held-out split with exactly those semantics.
+    """
+    dt = json.loads(dataset_type_json) if isinstance(dataset_type_json, str) else dict(dataset_type_json)
+    with open(data_path) as f:
+        rows = json.load(f)
+
+    out_field = dt.get("field_output") or "output"
+    eos = tokenizer.eos_token_id
+    bos = tokenizer.bos_token_id
+
+    train_items, dev_items, skipped = [], [], 0
+    dev_mod = max(2, int(round(1.0 / max(dev_frac, 1e-6))))
+    for row in rows:
+        output = row.get(out_field)
+        if not output:
+            skipped += 1
+            continue
+        prompt_ids = tokenizer(_instruct_prompt_text(row, dt),
+                               add_special_tokens=True).input_ids
+        resp_ids = tokenizer(str(output), add_special_tokens=True).input_ids
+        if bos is not None and resp_ids and resp_ids[0] == bos:
+            resp_ids = resp_ids[1:]
+        if eos is not None and (not resp_ids or resp_ids[-1] != eos):
+            resp_ids = resp_ids + [eos]
+        if not resp_ids:
+            skipped += 1
+            continue
+
+        input_ids = (list(prompt_ids) + list(resp_ids))[:seq_len]
+        labels = ([-100] * len(prompt_ids) + list(resp_ids))[:seq_len]
+        if not any(l != -100 for l in labels):
+            skipped += 1
+            continue
+        item = {"input_ids": input_ids, "labels": labels,
+                "attention_mask": [1] * len(input_ids)}
+        if _stable_hash(row) % dev_mod == 0 and len(dev_items) < dev_cap:
+            dev_items.append(item)
+        else:
+            train_items.append(item)
+
+    stats = {"rows": len(rows), "train": len(train_items), "dev": len(dev_items),
+             "skipped": skipped,
+             "train_tokens": int(sum(len(it["input_ids"]) for it in train_items))}
+    log(f"[chat_data] instruct prepared: {stats}")
+    return train_items, dev_items, stats
+
+
 def prepare_dataset(tokenizer, data_path, dataset_type_json, model_path, seq_len,
                     dev_frac=0.02, dev_cap=200, log=print):
     """Load + tokenize everything. Returns (train_items, dev_items, stats)."""

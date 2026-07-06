@@ -107,11 +107,16 @@ def main() -> None:
 
     def one_attempt(attempt: int) -> int:
         if args.task_type in ("InstructTextTask", "ChatTask"):
-            if args.task_type == "ChatTask" and plan_mod.needs_modern_stack(info):
+            if plan_mod.needs_modern_stack(info):
+                # custom archs (quasar) can only run on the v5 stack; this covers
+                # both ChatTask lineages and the pre-boss quasar instruct task
                 rc = run([MODERN_PY, os.path.join(SRC, "train_chat_modern.py"),
                           *common,
                           "--data-path", data_path,
-                          "--dataset-type", args.dataset_type], end_ts)
+                          "--dataset-type", args.dataset_type,
+                          "--task-format",
+                          "instruct" if args.task_type == "InstructTextTask" else "chat"],
+                         end_ts)
                 if rc != 42:
                     return rc
                 print("[main] modern stack unavailable (rc=42); legacy fallback", flush=True)

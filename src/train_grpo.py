@@ -186,6 +186,11 @@ def main() -> None:
             callbacks=[Clock()],
         )
 
+    # TRL's colocate vLLM path reads torchrun-style env vars even single-process
+    for k, v in (("RANK", "0"), ("LOCAL_RANK", "0"), ("WORLD_SIZE", "1"),
+                 ("MASTER_ADDR", "127.0.0.1"), ("MASTER_PORT", "29517")):
+        os.environ.setdefault(k, v)
+
     trainer = None
     if use_vllm:
         try:

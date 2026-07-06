@@ -53,9 +53,13 @@ WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".gguf", ".h5", ".msgp
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="ChatTask trainer (modern venv)")
     parser.add_argument("--task-id", required=True)
-    parser.add_argument("--model", required=True, help="local path to the base checkpoint")
+    parser.add_argument("--model", "--model-path", dest="model", required=True,
+                        help="local path to the base checkpoint")
     parser.add_argument("--data-path", required=True)
     parser.add_argument("--dataset-type", default="{}")
+    parser.add_argument("--task-format", choices=["chat", "instruct"], default="chat",
+                        help="chat = ChatTask conversations; instruct = axolotl "
+                             "user-defined instruction format (pre-boss quasar task)")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--end-ts", type=float, default=0.0)
     parser.add_argument("--num-gpus", type=int, default=4)
@@ -305,7 +309,8 @@ def train(args):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     sys.path.insert(0, str(SRC_DIR))
-    from chat_data import ListDataset, make_collate, prepare_dataset
+    from chat_data import (ListDataset, make_collate, prepare_dataset,
+                           prepare_instruct_dataset)
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -342,9 +347,14 @@ def train(args):
 
     # ---- data (deterministic, done identically on every rank) ----
     seq_len = SEQ_LEN
-    train_items, dev_items, stats = prepare_dataset(
-        tokenizer, args.data_path, args.dataset_type, model_path, seq_len, log=log
-    )
+    if args.task_format == "instruct":
+        train_items, dev_items, stats = prepare_instruct_dataset(
+            tokenizer, args.data_path, args.dataset_type, seq_len, log=log
+        )
+    else:
+        train_items, dev_items, stats = prepare_dataset(
+            tokenizer, args.data_path, args.dataset_type, model_path, seq_len, log=log
+        )
     if not train_items:
         log("[train] no trainable rows; emitting base checkpoint unchanged")
         if accelerator.is_main_process:

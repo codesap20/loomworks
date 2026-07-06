@@ -1,0 +1,401 @@
+"""Instruct/Chat SFT trainer (standard architectures, legacy stack).
+
+Recipe outline:
+  * axolotl-tokenized data (see tok_axolotl.py) so formatting == validator eval
+  * WSD learning-rate schedule: warmup -> flat -> linear decay, where the decay
+    onset is chosen at runtime from measured step time so the schedule finishes
+    cooling exactly at the wall-clock deadline
+  * bf16 full finetune when the optimizer fits, high-rank LoRA otherwise
+  * sequence packing through DataCollatorWithFlattening (FA2 varlen)
+  * CPU-shadow EMA of trainable weights; at the end the better of {EMA, best
+    raw checkpoint} on the dev split is what gets submitted
+  * optional KL(ft||base) penalty matching the validator's USE_KL scoring
+"""
+
+import argparse
+import json
+import math
+import os
+import shutil
+import sys
+import time
+
+import torch
+import torch.nn.functional as F
+
+import paths
+import plan as plan_mod
+
+
+def log(msg: str) -> None:
+    if int(os.environ.get("RANK", "0")) == 0:
+        print(f"[sft {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--task-id", required=True)
+    ap.add_argument("--model-path", required=True)
+    ap.add_argument("--base-model-id", required=True)
+    ap.add_argument("--tokenized-dir", required=True)
+    ap.add_argument("--output-dir", required=True)
+    ap.add_argument("--end-ts", type=float, required=True)
+    ap.add_argument("--num-gpus", type=int, default=1)
+    ap.add_argument("--state-file", default=paths.STATE_FILE)
+    return ap.parse_args()
+
+
+def read_state(path: str) -> dict:
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def maybe_reexec_distributed(args: argparse.Namespace) -> None:
+    if args.num_gpus > 1 and "RANK" not in os.environ:
+        cmd = ["torchrun", "--nproc_per_node", str(args.num_gpus),
+               os.path.abspath(__file__)] + sys.argv[1:]
+        log(f"re-exec: {' '.join(cmd)}")
+        os.execvp("torchrun", cmd)
+
+
+# --------------------------------------------------------------------------- #
+# schedule: warmup -> flat -> runtime-planned linear decay                     #
+# --------------------------------------------------------------------------- #
+
+class WsdPlan:
+    """Mutable schedule state shared between the lambda and the clock callback."""
+
+    def __init__(self, warmup_steps: int):
+        self.warmup = max(1, warmup_steps)
+        self.decay_start: int | None = None
+        self.decay_len: int = 1
+        self.floor = 0.05
+
+    def factor(self, step: int) -> float:
+        if step < self.warmup:
+            return step / self.warmup
+        if self.decay_start is not None and step >= self.decay_start:
+            frac = min(1.0, (step - self.decay_start) / max(1, self.decay_len))
+            return 1.0 - (1.0 - self.floor) * frac
+        return 1.0
+
+
+def main() -> None:
+    args = parse_args()
+    maybe_reexec_distributed(args)
+
+    from datasets import load_from_disk
+    from transformers import (AutoModelForCausalLM, AutoTokenizer,
+                              DataCollatorWithFlattening, Trainer,
+                              TrainerCallback, TrainingArguments)
+
+    state = read_state(args.state_file)
+    sft_state = state.get("sft", {})
+    is_main = int(os.environ.get("RANK", "0")) == 0
+
+    train_ds = load_from_disk(os.path.join(args.tokenized_dir, "train"))
+    dev_ds = load_from_disk(os.path.join(args.tokenized_dir, "dev"))
+    train_ds = train_ds.map(lambda r: {"length": len(r["input_ids"])})
+    with open(os.path.join(args.tokenized_dir, "meta.json")) as f:
+        meta = json.load(f)
+
+    info = plan_mod.probe_model(args.model_path)
+    n_gpus, free_gib = plan_mod.gpu_inventory()
+    regime = plan_mod.choose_regime(info["params"], n_gpus, free_gib)
+    use_kl = os.environ.get("USE_KL") == "1"
+    kl_coef = float(os.environ.get("KL_COEF") or 0.1) if use_kl else 0.0
+    if use_kl and regime["adapter"] is None and (info["params"] or 0) > 4.5e9:
+        # a frozen reference copy would not fit next to full-ft states
+        regime["adapter"] = {"r": 64, "alpha": 128, "dropout": 0.05}
+        log("KL task on large model -> switching to LoRA for a free reference")
+
+    lora = regime["adapter"]
+    peak_lr = plan_mod.sft_lr(info["params"])
+    if lora:
+        peak_lr = min(2.5e-4, peak_lr * 5)
+
+    # ---- model ------------------------------------------------------------ #
+    attn_impl = "flash_attention_2"
+    try:
+        import flash_attn  # noqa: F401
+    except Exception:
+        attn_impl = "sdpa"
+
+    def load_base():
+        try:
+            return AutoModelForCausalLM.from_pretrained(
+                args.model_path, torch_dtype=torch.bfloat16, attn_implementation=attn_impl)
+        except Exception as e:
+            log(f"{attn_impl} load failed ({e}); retrying with sdpa")
+            return AutoModelForCausalLM.from_pretrained(
+                args.model_path, torch_dtype=torch.bfloat16, attn_implementation="sdpa")
+
+    model = load_base()
+    model.config.use_cache = False
+    packing = attn_impl == "flash_attention_2" and not use_kl
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    if lora:
+        from peft import LoraConfig, get_peft_model
+        model = get_peft_model(model, LoraConfig(
+            r=lora["r"], lora_alpha=lora["alpha"], lora_dropout=lora["dropout"],
+            target_modules="all-linear", task_type="CAUSAL_LM"))
+        if is_main:
+            model.print_trainable_parameters()
+
+    ref_model = None
+    if use_kl and not lora:
+        ref_model = load_base().cuda().eval()
+        for p in ref_model.parameters():
+            p.requires_grad_(False)
+
+    # ---- batch / step planning -------------------------------------------- #
+    seq_len = meta.get("seq_len", 4096)
+    micro_bs = sft_state.get("micro_batch") or plan_mod.micro_batch_for(
+        info["params"], min(seq_len, meta.get("len_p95", seq_len)), free_gib, lora is None)
+    if packing:
+        micro_bs = max(1, micro_bs // 2)  # flattened rows are mb x len long
+    world = max(1, args.num_gpus)
+    target_effective = 64
+    grad_accum = max(1, round(target_effective / (micro_bs * world)))
+
+    steps_per_epoch = max(1, math.ceil(len(train_ds) / (micro_bs * world * grad_accum)))
+    epoch_cap = 4 if len(train_ds) < 10_000 else 3
+    budget_s = args.end_ts - time.time()
+    save_margin = 300 + (600 if regime["dist"] == "zero3" else 0)
+
+    wsd = WsdPlan(warmup_steps=max(4, int(0.02 * steps_per_epoch * 2)))
+    planned = {"total": steps_per_epoch * epoch_cap}
+
+    # ---- trainer ----------------------------------------------------------- #
+    class KlTrainer(Trainer):
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+            outputs = model(**inputs)
+            loss = outputs.loss
+            if kl_coef > 0.0:
+                labels = inputs["labels"]
+                mask = labels != -100
+                if mask.any():
+                    with torch.no_grad():
+                        if lora:
+                            with model.disable_adapter():
+                                ref_logits = model(
+                                    input_ids=inputs["input_ids"],
+                                    attention_mask=inputs.get("attention_mask")).logits
+                        else:
+                            ref_logits = ref_model(
+                                input_ids=inputs["input_ids"],
+                                attention_mask=inputs.get("attention_mask")).logits
+                    ft_logp = F.log_softmax(outputs.logits.float(), dim=-1)
+                    ref_logp = F.log_softmax(ref_logits.float(), dim=-1)
+                    kl_tok = (ft_logp.exp() * (ft_logp - ref_logp)).sum(-1)
+                    kl = (kl_tok * mask).sum() / mask.sum()
+                    loss = loss + kl_coef * kl
+            return (loss, outputs) if return_outputs else loss
+
+        def create_scheduler(self, num_training_steps, optimizer=None):
+            opt = optimizer or self.optimizer
+            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                opt, lambda step: wsd.factor(step))
+            return self.lr_scheduler
+
+    trainer_cls = KlTrainer
+
+    # EMA shadow of trainable weights on CPU (skipped under zero3: weights are sharded)
+    ema_enabled = regime["dist"] != "zero3"
+    ema: dict[str, torch.Tensor] = {}
+    ema_interval = 2 if lora else 8
+
+    class EmaCallback(TrainerCallback):
+        def on_step_end(self, targs, tstate, control, model=None, **kw):
+            if not ema_enabled or tstate.global_step % ema_interval:
+                return
+            half_life = max(50, int(0.10 * planned["total"]))
+            decay = 0.5 ** (ema_interval / half_life)
+            with torch.no_grad():
+                for name, p in model.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    cpu = p.detach().to("cpu", torch.float32, non_blocking=False)
+                    if name in ema:
+                        ema[name].mul_(decay).add_(cpu, alpha=1 - decay)
+                    else:
+                        ema[name] = cpu.clone()
+
+    best = {"loss": float("inf"), "saved_at": 0.0}
+
+    def export(trainer, tag: str) -> None:
+        if regime["dist"] != "zero3" and not is_main:
+            return
+        os.makedirs(args.output_dir, exist_ok=True)
+        trainer.save_model(args.output_dir)
+        if is_main:
+            tokenizer.save_pretrained(args.output_dir)
+            _patch_architectures(args.output_dir, info["architectures"])
+            log(f"exported ({tag}) dev_loss={best['loss']:.5f}")
+
+    class ClockCallback(TrainerCallback):
+        def __init__(self):
+            self.t0 = None
+            self.t_per_step = None
+
+        def on_step_end(self, targs, tstate, control, **kw):
+            step = tstate.global_step
+            if step == 3:
+                self.t0 = time.time()
+            elif step == 13 and self.t0:
+                self.t_per_step = (time.time() - self.t0) / 10
+                remaining = args.end_ts - time.time() - save_margin
+                achievable = int(remaining / self.t_per_step * 0.9) + step
+                planned["total"] = max(step + 8, min(steps_per_epoch * epoch_cap, achievable))
+                wsd.decay_start = int(planned["total"] * 0.72)
+                wsd.decay_len = planned["total"] - wsd.decay_start
+                targs.eval_steps = max(20, planned["total"] // 8)
+                if hasattr(tstate, "eval_steps"):
+                    tstate.eval_steps = targs.eval_steps
+                log(f"replan: t/step={self.t_per_step:.2f}s total={planned['total']} "
+                    f"decay@{wsd.decay_start} eval_every={targs.eval_steps}")
+            if planned["total"] and step >= planned["total"]:
+                control.should_training_stop = True
+                control.should_evaluate = True
+            if time.time() > args.end_ts - save_margin:
+                control.should_training_stop = True
+            return control
+
+        def on_evaluate(self, targs, tstate, control, metrics=None, **kw):
+            loss = (metrics or {}).get("eval_loss")
+            if loss is None:
+                return
+            if loss < best["loss"] * 0.999 and (time.time() - best["saved_at"] > 600
+                                                or best["saved_at"] == 0.0):
+                best["loss"] = loss
+                best["saved_at"] = time.time()
+                export(trainer, f"best@{tstate.global_step}")
+
+    ds_cfg = None
+    if regime["dist"] == "zero3":
+        ds_cfg = os.path.join(os.path.dirname(__file__), "..", "ds_config", "zero3.json")
+
+    targs = TrainingArguments(
+        output_dir=os.path.join(paths.WORK_ROOT, "hf_out", args.task_id),
+        per_device_train_batch_size=micro_bs,
+        per_device_eval_batch_size=max(1, micro_bs),
+        gradient_accumulation_steps=grad_accum,
+        num_train_epochs=epoch_cap,
+        learning_rate=peak_lr,
+        weight_decay=0.01,
+        max_grad_norm=1.0,
+        optim="adamw_torch_fused",
+        bf16=True,
+        tf32=True,
+        gradient_checkpointing=(info["params"] or 0) > 2.5e9,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        eval_strategy="steps",
+        eval_steps=max(20, steps_per_epoch // 4),
+        save_strategy="no",
+        logging_steps=25,
+        group_by_length=True,
+        length_column_name="length",
+        neftune_noise_alpha=1.0 if len(train_ds) < 20_000 else None,
+        deepspeed=ds_cfg,
+        report_to=[],
+        seed=1337,
+        remove_unused_columns=False,
+        dataloader_num_workers=2,
+    )
+
+    from transformers import DataCollatorForSeq2Seq
+    _MODEL_KEYS = ("input_ids", "attention_mask", "labels")
+
+    def strip_extras(inner):
+        def collate(features):
+            return inner([{k: v for k, v in f.items() if k in _MODEL_KEYS} for f in features])
+        return collate
+
+    pad_collator = strip_extras(
+        DataCollatorForSeq2Seq(tokenizer, padding=True, label_pad_token_id=-100))
+    train_collator = strip_extras(DataCollatorWithFlattening()) if packing else pad_collator
+
+    class SftTrainer(trainer_cls):
+        def get_eval_dataloader(self, eval_dataset=None):
+            # eval must not be packed: loss weighting would differ from the validator
+            self.data_collator, keep = pad_collator, self.data_collator
+            try:
+                return super().get_eval_dataloader(eval_dataset)
+            finally:
+                self.data_collator = keep
+
+    trainer = SftTrainer(
+        model=model,
+        args=targs,
+        train_dataset=train_ds,
+        eval_dataset=dev_ds,
+        data_collator=train_collator,
+        processing_class=tokenizer,
+        callbacks=[ClockCallback(), EmaCallback()],
+    )
+
+    try:
+        trainer.train()
+    except torch.cuda.OutOfMemoryError:
+        state.setdefault("sft", {})["micro_batch"] = max(1, micro_bs // 2)
+        with open(args.state_file, "w") as f:
+            json.dump(state, f)
+        raise
+
+    # ---- final selection: raw vs EMA on dev -------------------------------- #
+    final_metrics = trainer.evaluate()
+    raw_loss = final_metrics.get("eval_loss", float("inf"))
+    picked = "raw"
+    if ema_enabled and ema and time.time() < args.end_ts - save_margin / 2:
+        backup = {n: p.detach().to("cpu", torch.float32) for n, p in model.named_parameters()
+                  if p.requires_grad}
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                if p.requires_grad and n in ema:
+                    p.copy_(ema[n].to(p.device, p.dtype))
+        ema_loss = trainer.evaluate().get("eval_loss", float("inf"))
+        log(f"final: raw={raw_loss:.5f} ema={ema_loss:.5f} best_exported={best['loss']:.5f}")
+        if ema_loss <= raw_loss and ema_loss < best["loss"]:
+            best["loss"], picked = ema_loss, "ema"
+            export(trainer, "ema-final")
+        else:
+            with torch.no_grad():
+                for n, p in model.named_parameters():
+                    if p.requires_grad and n in backup:
+                        p.copy_(backup[n].to(p.device, p.dtype))
+    if picked == "raw" and raw_loss < best["loss"]:
+        best["loss"] = raw_loss
+        export(trainer, "raw-final")
+    if best["saved_at"] == 0.0:
+        export(trainer, "fallback-final")
+
+    if is_main:
+        with open(os.path.join(os.path.dirname(args.output_dir), "success.txt"), "w") as f:
+            f.write(f"{picked} {best['loss']}\n")
+    log("done")
+
+
+def _patch_architectures(out_dir: str, architectures: list) -> None:
+    """Keep the submitted config's architectures identical to the base model's
+    (the validator compares configs for its is_finetune check; PEFT/save quirks
+    must not rename the arch)."""
+    cfg_path = os.path.join(out_dir, "config.json")
+    if not architectures or not os.path.isfile(cfg_path):
+        return
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    if cfg.get("architectures") != architectures:
+        cfg["architectures"] = architectures
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f, indent=2)
+
+
+if __name__ == "__main__":
+    main()

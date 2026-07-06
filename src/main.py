@@ -95,9 +95,12 @@ def main() -> None:
               "--state-file", paths.STATE_FILE]
 
     def attempts() -> bool:
+        # keep enough tail for a save: 15 min on long tasks, proportionally less on short ones
+        retry_guard = min(900, max(120, (end_ts - start) * 0.15))
         for attempt in range(1, MAX_ATTEMPTS + 1):
-            if time.time() > end_ts - 900:
-                print(f"[main] <15min left before attempt {attempt}; stopping retries", flush=True)
+            if time.time() > end_ts - retry_guard:
+                print(f"[main] <{retry_guard / 60:.0f}min left before attempt {attempt}; "
+                      "stopping retries", flush=True)
                 break
             rc = one_attempt(attempt)
             if rc == 0 and submission_ok(out_dir):

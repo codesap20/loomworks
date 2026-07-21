@@ -87,11 +87,20 @@ def main() -> None:
     params = info["params"] or 7e9
     use_lora = params > 9e9 or (n_gpus == 1 and params > 4e9)
 
-    # DPO LR: the earlier 5e-7 base (peak ~7.6e-7 at 3B) was far too timid —
-    # measured DPO eval loss 0.52 vs the champion's 0.004 on the same task. The
-    # validator ranks on DPO loss alone, so drive the preference margin harder.
-    lr = 3e-6 * math.sqrt(7e9 / params)
-    lr = min(3e-5, max(1e-6, lr)) * float(os.environ.get("SN56_DPO_LR_MULT") or 1.0)
+    # DPO LR — hand-tuned size buckets matching the open-sourced champion's
+    # dpo_config table (our old 5e-7 peaked ~7.6e-7 at 3B and lost 0.52 vs their
+    # 0.004; the validator ranks on DPO loss alone). Not sqrt-scaled: small
+    # models want it hotter.
+    pb = params / 1e9
+    if pb < 1:      lr = 1.35e-5
+    elif pb < 2:    lr = 8.7e-6
+    elif pb < 4:    lr = 6.5e-6
+    elif pb < 5:    lr = 6.25e-6
+    elif pb < 9:    lr = 7.5e-6
+    elif pb < 12:   lr = 5e-6
+    elif pb < 15:   lr = 8.5e-6
+    else:           lr = 8e-6
+    lr *= float(os.environ.get("SN56_DPO_LR_MULT") or 1.0)
     if use_lora:
         lr *= 4
 
@@ -171,13 +180,16 @@ def main() -> None:
         per_device_train_batch_size=micro,
         per_device_eval_batch_size=micro,
         gradient_accumulation_steps=accum,
-        num_train_epochs=2 if len(train_rows) < 6000 else 1,
+        num_train_epochs=int(os.environ.get("SN56_DPO_EPOCHS") or 3),  # champion uses 3
         learning_rate=lr,
-        lr_scheduler_type="cosine",
-        warmup_ratio=0.05,
+        lr_scheduler_type="cosine_with_min_lr",
+        lr_scheduler_kwargs={"min_lr_rate": 0.25},   # champion's cosine floor
+        warmup_ratio=0.03,
+        weight_decay=0.0,                            # champion: wd 0 for DPO
         max_grad_norm=1.0,
         bf16=True,
         tf32=True,
+        optim="paged_adamw_8bit",                    # champion's DPO optimizer
         gradient_checkpointing=params > 2.5e9,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         eval_strategy="steps",

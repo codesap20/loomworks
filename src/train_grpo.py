@@ -113,7 +113,9 @@ def main() -> None:
     unbounded_hack = any(k in reward_src for k in ("len(", "/ (len", "count"))
     if verifiable:
         beta = 0.1
-        lr_base, lr_hi = 1e-4, 8e-4          # hot: gradient signal is clean
+        # winners run code-reward LR up to ~1.6e-3 (per-model swept); we can't
+        # sweep locally, so stay in a moderate hot band well short of that.
+        lr_base, lr_hi = 5e-5, 2e-4
     elif unbounded_hack:
         beta = 0.12                          # tighter leash vs length/format hacking
         lr_base, lr_hi = 6e-6, 1.5e-5

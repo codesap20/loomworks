@@ -276,9 +276,12 @@ def main() -> None:
     # Greedy checkpoint soup (Wortsman 2022): keep the K lowest-dev-loss weight
     # snapshots; at the end greedily average them, accepting a candidate only if
     # held-out dev loss improves (so the soup is never worse than the best single).
-    # This is the champion's edge we lacked. Full-FT only; capped by host RAM.
-    soup_enabled = (regime["dist"] in ("single", "ddp") and lora is None
-                    and os.environ.get("SN56_SKIP_SOUP") != "1")
+    # DEFAULT OFF: measured on 3B/alpaca vs champion, the post-early-stop
+    # checkpoints are too correlated to benefit — soup matched (never beat) the
+    # best single (1.018 either way) while adding K-snapshot RAM (OOM risk on
+    # 7-12B) + eval-noise candidates. Opt in with SN56_USE_SOUP=1.
+    soup_enabled = (os.environ.get("SN56_USE_SOUP") == "1"
+                    and regime["dist"] in ("single", "ddp") and lora is None)
     soup_k = 4
     soup_pool: list[tuple[float, dict]] = []  # (dev_loss, {name: bf16 cpu tensor})
 

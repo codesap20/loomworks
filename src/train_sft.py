@@ -199,7 +199,18 @@ def main() -> None:
             peak_lr = lr_probe.lr_range_probe(model, probe_batches, peak_lr, log=log)
         except Exception as e:
             log(f"lr probe failed ({type(e).__name__}: {e}); heuristic LR {peak_lr:.2e}")
-    epoch_cap = 4 if len(train_ds) < 10_000 else 3
+    # Small datasets overfit fast (measured: 3B/alpaca hit its dev-loss floor at
+    # ~0.5 epoch then degraded for 3.5 more). Cap epochs tighter for small data
+    # and lean on the overfitting early-stop below. Env-overridable for sweeps.
+    if len(train_ds) < 4_000:
+        epoch_cap = 3
+    elif len(train_ds) < 15_000:
+        epoch_cap = 2
+    else:
+        epoch_cap = 3
+    epoch_cap = int(os.environ.get("SN56_EPOCH_CAP") or epoch_cap)
+    lr_mult = float(os.environ.get("SN56_LR_MULT") or 1.0)
+    peak_lr *= lr_mult
     save_margin = 300 + (600 if regime["dist"] == "zero3" else 0)
 
     wsd = WsdPlan(warmup_steps=max(4, int(0.02 * steps_per_epoch * 2)))
@@ -288,7 +299,8 @@ def main() -> None:
                 planned["total"] = max(step + 8, min(steps_per_epoch * epoch_cap, achievable))
                 wsd.decay_start = int(planned["total"] * 0.72)
                 wsd.decay_len = planned["total"] - wsd.decay_start
-                targs.eval_steps = max(20, planned["total"] // 8)
+                # eval ~12x/run so the early dev-loss minimum is actually sampled
+                targs.eval_steps = max(12, planned["total"] // 12)
                 if hasattr(tstate, "eval_steps"):
                     tstate.eval_steps = targs.eval_steps
                 log(f"replan: t/step={self.t_per_step:.2f}s total={planned['total']} "
@@ -304,11 +316,23 @@ def main() -> None:
             loss = (metrics or {}).get("eval_loss")
             if loss is None:
                 return
-            if loss < best["loss"] * 0.999 and (time.time() - best["saved_at"] > 600
-                                                or best["saved_at"] == 0.0):
+            if loss < best["loss"] * 0.999:
+                # save every genuine improvement (a 3B save is ~10s; the old
+                # 600s throttle could skip the true minimum on short runs)
                 best["loss"] = loss
                 best["saved_at"] = time.time()
+                best["stale"] = 0
                 export(trainer, f"best@{tstate.global_step}")
+            else:
+                # overfitting guard: once dev loss sits >3% above best for a few
+                # consecutive evals, more training only degrades — stop and keep
+                # the best. Frees the remaining budget and avoids shipping a worse
+                # late checkpoint.
+                best["stale"] = best.get("stale", 0) + 1
+                if loss > best["loss"] * 1.03 and best["stale"] >= 3:
+                    log(f"early-stop: dev {loss:.4f} > best {best['loss']:.4f} x1.03 "
+                        f"for {best['stale']} evals")
+                    control.should_training_stop = True
 
     ds_cfg = None
     if regime["dist"] == "zero3":

@@ -273,6 +273,27 @@ def main() -> None:
 
     best = {"loss": float("inf"), "saved_at": 0.0}
 
+    # Greedy checkpoint soup (Wortsman 2022): keep the K lowest-dev-loss weight
+    # snapshots; at the end greedily average them, accepting a candidate only if
+    # held-out dev loss improves (so the soup is never worse than the best single).
+    # This is the champion's edge we lacked. Full-FT only; capped by host RAM.
+    soup_enabled = (regime["dist"] in ("single", "ddp") and lora is None
+                    and os.environ.get("SN56_SKIP_SOUP") != "1")
+    soup_k = 4
+    soup_pool: list[tuple[float, dict]] = []  # (dev_loss, {name: bf16 cpu tensor})
+
+    def snapshot_trainables(mdl):
+        return {n: p.detach().to("cpu", torch.bfloat16)
+                for n, p in mdl.named_parameters() if p.requires_grad}
+
+    def maybe_pool(mdl, loss):
+        if not soup_enabled:
+            return
+        if len(soup_pool) < soup_k or loss < max(l for l, _ in soup_pool):
+            soup_pool.append((loss, snapshot_trainables(mdl)))
+            soup_pool.sort(key=lambda x: x[0])
+            del soup_pool[soup_k:]
+
     def export(trainer, tag: str) -> None:
         if regime["dist"] != "zero3" and not is_main:
             return
@@ -316,6 +337,7 @@ def main() -> None:
             loss = (metrics or {}).get("eval_loss")
             if loss is None:
                 return
+            maybe_pool(trainer.model, loss)
             if loss < best["loss"] * 0.999:
                 # save every genuine improvement (a 3B save is ~10s; the old
                 # 600s throttle could skip the true minimum on short runs)
@@ -393,31 +415,59 @@ def main() -> None:
             json.dump(state, f)
         raise
 
-    # ---- final selection: raw vs EMA on dev -------------------------------- #
-    final_metrics = trainer.evaluate()
-    raw_loss = final_metrics.get("eval_loss", float("inf"))
-    picked = "raw"
-    if ema_enabled and ema and time.time() < args.end_ts - save_margin / 2:
-        backup = {n: p.detach().to("cpu", torch.float32) for n, p in model.named_parameters()
-                  if p.requires_grad}
+    # ---- final selection: best-on-disk vs raw vs EMA vs greedy soup -------- #
+    # Measure every candidate as a pure dev-loss reading (each restores a known
+    # state), then load + export the single winner once. `best` (the lowest
+    # checkpoint seen during training) is already on disk as the safe default.
+    def load_weights(state):
         with torch.no_grad():
             for n, p in model.named_parameters():
-                if p.requires_grad and n in ema:
-                    p.copy_(ema[n].to(p.device, p.dtype))
-        ema_loss = trainer.evaluate().get("eval_loss", float("inf"))
-        log(f"final: raw={raw_loss:.5f} ema={ema_loss:.5f} best_exported={best['loss']:.5f}")
-        if ema_loss <= raw_loss and ema_loss < best["loss"]:
-            best["loss"], picked = ema_loss, "ema"
-            export(trainer, "ema-final")
-        else:
-            with torch.no_grad():
-                for n, p in model.named_parameters():
-                    if p.requires_grad and n in backup:
-                        p.copy_(backup[n].to(p.device, p.dtype))
-    if picked == "raw" and raw_loss < best["loss"]:
-        best["loss"] = raw_loss
-        export(trainer, "raw-final")
-    if best["saved_at"] == 0.0:
+                if p.requires_grad and n in state:
+                    p.copy_(state[n].to(p.device, p.dtype))
+
+    def eval_now():
+        return trainer.evaluate().get("eval_loss", float("inf"))
+
+    raw_state = snapshot_trainables(model)
+    raw_loss = eval_now()
+    candidates = {"raw": (raw_loss, raw_state)}  # "best" (on disk) is the baseline
+
+    have_budget = time.time() < args.end_ts - save_margin
+    if ema_enabled and ema and have_budget:
+        load_weights(ema)
+        candidates["ema"] = (eval_now(), {n: t.clone() for n, t in ema.items()})
+
+    if soup_enabled and len(soup_pool) >= 2 and have_budget:
+        try:
+            running = {n: t.to(torch.float32).clone() for n, t in soup_pool[0][1].items()}
+            load_weights(running)
+            soup_loss = eval_now()
+            n_accepted = 1
+            for _, cand in soup_pool[1:]:
+                trial = {n: (running[n] * n_accepted + cand[n].to(torch.float32)) / (n_accepted + 1)
+                         for n in running}
+                load_weights(trial)
+                tl = eval_now()
+                if tl < soup_loss - 1e-4:
+                    running, soup_loss, n_accepted = trial, tl, n_accepted + 1
+            log(f"soup: {n_accepted}/{len(soup_pool)} ckpts -> dev {soup_loss:.5f} "
+                f"(best single {soup_pool[0][0]:.5f})")
+            candidates["soup"] = (soup_loss, {n: t.to(torch.bfloat16) for n, t in running.items()})
+        except Exception as e:
+            log(f"soup failed ({type(e).__name__}: {e})")
+    soup_pool.clear()
+
+    winner = min(candidates.items(), key=lambda kv: kv[1][0])
+    picked, (picked_loss, picked_state) = winner[0], winner[1]
+    log(f"final: best_ondisk={best['loss']:.5f} " +
+        " ".join(f"{k}={v[0]:.5f}" for k, v in candidates.items()) + f" -> pick {picked}")
+    if picked_loss < best["loss"]:
+        load_weights(picked_state)
+        best["loss"] = picked_loss
+        export(trainer, f"{picked}-final")
+    else:
+        picked = "best-ondisk"  # the training-time best checkpoint already on disk wins
+    if best["saved_at"] == 0.0 and not os.path.isdir(args.output_dir):
         export(trainer, "fallback-final")
 
     if is_main:

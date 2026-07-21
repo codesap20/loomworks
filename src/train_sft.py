@@ -135,7 +135,15 @@ def main() -> None:
 
     model = load_base()
     model.config.use_cache = False
-    packing = attn_impl == "flash_attention_2" and not use_kl
+    # Sequence packing via DataCollatorWithFlattening needs FA2 VARLEN to isolate
+    # packed documents. FA2 doesn't reliably engage varlen here (HF warns the
+    # model was init'd on CPU), so packed long-sequence documents attend across
+    # each other -> training loss collapses to ~ln(vocab) (measured: dolly train
+    # loss ~12 while eval was fine; alpaca's short seqs hid it). Correctness over
+    # throughput: keep FA2 for the attention compute but pad instead of flatten.
+    # group_by_length already keeps padding waste low. Opt back in via SN56_PACK=1
+    # only after verifying varlen on the target model.
+    packing = os.environ.get("SN56_PACK") == "1" and attn_impl == "flash_attention_2" and not use_kl
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     if tokenizer.pad_token_id is None:

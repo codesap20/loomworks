@@ -69,20 +69,10 @@ def needs_modern_stack(model_info: dict) -> bool:
 
 
 def sft_lr(params: float | None) -> float:
-    """SFT peak LR — the champion's open instruct_config.py size table (their
-    winning values, NOT sqrt-scaled). Our old 2e-5*sqrt heuristic gave ~3e-5 at
-    3B, ~2.5x below their 7.5e-5 — the same too-timid LR that lost DPO/GRPO.
-    Overridable with SN56_SFT_LR_MULT for sweeps."""
-    import os
-    p = (params or 7e9) / 1e9
-    if p < 2:      lr = 1.0e-4
-    elif p < 4:    lr = 7.5e-5
-    elif p < 5:    lr = 7.0e-5
-    elif p < 9:    lr = 3.5e-5   # their table dips here (7-8B)
-    elif p < 15:   lr = 1.0e-4
-    else:          lr = 8.0e-5
-    lr *= float(os.environ.get("SN56_SFT_LR_MULT") or 1.0)
-    return float(lr)
+    """Param-scaled SFT peak LR: 2e-5 at 7B, sqrt-scaled, clamped."""
+    p = params or 7e9
+    lr = 2e-5 * math.sqrt(7e9 / p)
+    return float(min(2e-4, max(4e-6, lr)))
 
 
 def choose_regime(params: float | None, n_gpus: int, gpu_free_gib: float) -> dict:

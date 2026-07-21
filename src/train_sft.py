@@ -182,7 +182,8 @@ def main() -> None:
     # empirical LR: one-ramp range probe on cached batches (single-GPU, budget-gated)
     budget_s = args.end_ts - time.time()
     if (world == 1 and not use_kl and budget_s > 1800 and len(train_ds) >= 200
-            and not sft_state.get("skip_probe")):
+            and not sft_state.get("skip_probe")
+            and os.environ.get("SN56_SKIP_PROBE") != "1"):
         import lr_probe
         cuda_ok = torch.cuda.is_available()
         if cuda_ok:

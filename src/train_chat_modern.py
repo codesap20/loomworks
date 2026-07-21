@@ -399,7 +399,10 @@ def train(args):
         attach_cce_forward(model, linear_cross_entropy)
     log(f"[train] loss path: {'cut-cross-entropy' if use_cce else 'model logits CE'}")
 
-    model = accelerator.prepare(model)
+    # FSDP2 requires model + optimizer prepared TOGETHER (accelerate remaps the
+    # optimizer's param references after the model is converted to DTensors);
+    # preparing the model alone raises. Build the optimizer on the unwrapped
+    # model, then prepare both (+ loaders) in one call.
     model.train()
     optimizer = build_optimizer(model, base_lr)
 
@@ -408,7 +411,7 @@ def train(args):
                               collate_fn=collate, num_workers=2, pin_memory=True)
     dev_loader = DataLoader(ListDataset(dev_items), batch_size=MICRO_BATCH, shuffle=False,
                             collate_fn=collate, num_workers=0) if dev_items else None
-    optimizer, train_loader = accelerator.prepare(optimizer, train_loader)
+    model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
     if dev_loader is not None:
         dev_loader = accelerator.prepare(dev_loader)
 

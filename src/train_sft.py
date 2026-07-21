@@ -72,7 +72,7 @@ class WsdPlan:
         self.warmup = max(1, warmup_steps)
         self.decay_start: int | None = None
         self.decay_len: int = 1
-        self.floor = 0.05
+        self.floor = 0.10  # winners cool to ~0.25*peak; WSD's flat phase lets us floor lower
 
     def factor(self, step: int) -> float:
         if step < self.warmup:
@@ -166,8 +166,36 @@ def main() -> None:
     grad_accum = max(1, round(target_effective / (micro_bs * world)))
 
     steps_per_epoch = max(1, math.ceil(len(train_ds) / (micro_bs * world * grad_accum)))
-    epoch_cap = 4 if len(train_ds) < 10_000 else 3
+
+    from transformers import DataCollatorForSeq2Seq
+    _MODEL_KEYS = ("input_ids", "attention_mask", "labels")
+
+    def strip_extras(inner):
+        def collate(features):
+            return inner([{k: v for k, v in f.items() if k in _MODEL_KEYS} for f in features])
+        return collate
+
+    pad_collator = strip_extras(
+        DataCollatorForSeq2Seq(tokenizer, padding=True, label_pad_token_id=-100))
+    train_collator = strip_extras(DataCollatorWithFlattening()) if packing else pad_collator
+
+    # empirical LR: one-ramp range probe on cached batches (single-GPU, budget-gated)
     budget_s = args.end_ts - time.time()
+    if (world == 1 and not use_kl and budget_s > 1800 and len(train_ds) >= 200
+            and not sft_state.get("skip_probe")):
+        import lr_probe
+        cuda_ok = torch.cuda.is_available()
+        if cuda_ok:
+            model.cuda()
+        probe_batches = []
+        for i in range(6):
+            rows = [train_ds[(i * micro_bs + j) % len(train_ds)] for j in range(micro_bs)]
+            probe_batches.append(train_collator(rows))
+        try:
+            peak_lr = lr_probe.lr_range_probe(model, probe_batches, peak_lr, log=log)
+        except Exception as e:
+            log(f"lr probe failed ({type(e).__name__}: {e}); heuristic LR {peak_lr:.2e}")
+    epoch_cap = 4 if len(train_ds) < 10_000 else 3
     save_margin = 300 + (600 if regime["dist"] == "zero3" else 0)
 
     wsd = WsdPlan(warmup_steps=max(4, int(0.02 * steps_per_epoch * 2)))
@@ -309,18 +337,6 @@ def main() -> None:
         remove_unused_columns=False,
         dataloader_num_workers=2,
     )
-
-    from transformers import DataCollatorForSeq2Seq
-    _MODEL_KEYS = ("input_ids", "attention_mask", "labels")
-
-    def strip_extras(inner):
-        def collate(features):
-            return inner([{k: v for k, v in f.items() if k in _MODEL_KEYS} for f in features])
-        return collate
-
-    pad_collator = strip_extras(
-        DataCollatorForSeq2Seq(tokenizer, padding=True, label_pad_token_id=-100))
-    train_collator = strip_extras(DataCollatorWithFlattening()) if packing else pad_collator
 
     class SftTrainer(trainer_cls):
         def get_eval_dataloader(self, eval_dataset=None):

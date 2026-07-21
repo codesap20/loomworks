@@ -101,8 +101,31 @@ def main() -> None:
     budget_h = (args.end_ts - time.time()) / 3600
     max_completion = 512 if budget_h >= 1.5 else 384
 
-    lr = 1e-5 * (7e9 / params) ** 0.5
-    lr = min(1.2e-5, max(8e-7, lr * (3 if use_lora else 0.35)))
+    # Reward-function shape drives (beta, LR). Verifiable/binary rewards (code
+    # execution, math correctness) tolerate much hotter LR and want a firm KL
+    # leash; open-ended generic rewards want a gentler LR and moderate KL.
+    # The eval score is reward - 0.5*KL, so beta is never far below ~0.1.
+    reward_src = " ".join((s.get("reward_func") or "")
+                          for s in (dt.get("reward_functions") or [])).lower()
+    verifiable = any(k in reward_src for k in
+                     ("subprocess", "exec(", "compile(", "assert", "unittest",
+                      "== answer", "correct", "test_case", "verify", "sat_", "ded_", "abd_"))
+    unbounded_hack = any(k in reward_src for k in ("len(", "/ (len", "count"))
+    if verifiable:
+        beta = 0.1
+        lr_base, lr_hi = 1e-4, 8e-4          # hot: gradient signal is clean
+    elif unbounded_hack:
+        beta = 0.12                          # tighter leash vs length/format hacking
+        lr_base, lr_hi = 6e-6, 1.5e-5
+    else:
+        beta = 0.5                           # champion-lineage default for generic rewards
+        lr_base, lr_hi = 8e-7, 1.2e-5
+    beta = float(os.environ.get("GRPO_BETA") or beta)
+
+    lr = lr_base * (7e9 / params) ** 0.5
+    lr = min(lr_hi, max(lr_base * 0.5, lr * (3 if use_lora else 1.0)))
+    log(f"reward shape: verifiable={verifiable} unbounded={unbounded_hack} "
+        f"-> beta={beta} lr={lr:.2e}")
 
     state = {}
     try:
@@ -112,7 +135,8 @@ def main() -> None:
         pass
     grpo_state = state.get("grpo", {})
     use_vllm = not grpo_state.get("disable_vllm", False)
-    num_generations = grpo_state.get("num_generations", 8)
+    # winners run few generations and spend the budget on more optimizer steps
+    num_generations = grpo_state.get("num_generations", 4)
     micro = grpo_state.get("batch_size") or num_generations  # divisible by group
 
     end_ts = args.end_ts
@@ -161,7 +185,7 @@ def main() -> None:
             num_generations=num_generations,
             max_prompt_length=max_prompt,
             max_completion_length=max_completion,
-            beta=0.08,
+            beta=beta,
             learning_rate=lr,
             lr_scheduler_type="cosine",
             warmup_ratio=0.03,

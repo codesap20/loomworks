@@ -179,11 +179,14 @@ def main() -> None:
         DataCollatorForSeq2Seq(tokenizer, padding=True, label_pad_token_id=-100))
     train_collator = strip_extras(DataCollatorWithFlattening()) if packing else pad_collator
 
-    # empirical LR: one-ramp range probe on cached batches (single-GPU, budget-gated)
+    # Empirical LR range probe — DEFAULT OFF. Measured on sim-alpaca (Qwen3-0.6B,
+    # hidden-eval masked-CE): the ramp-test knee overestimates the best FINAL LR,
+    # so the probe picked ~2.7x too hot and scored 2.14 vs the heuristic's 1.67
+    # (worse than the untrained base's 1.83). The param-scaled heuristic wins.
+    # Opt in with SN56_USE_PROBE=1 only after re-validating on the target model.
     budget_s = args.end_ts - time.time()
-    if (world == 1 and not use_kl and budget_s > 1800 and len(train_ds) >= 200
-            and not sft_state.get("skip_probe")
-            and os.environ.get("SN56_SKIP_PROBE") != "1"):
+    if (os.environ.get("SN56_USE_PROBE") == "1"
+            and world == 1 and not use_kl and budget_s > 1800 and len(train_ds) >= 200):
         import lr_probe
         cuda_ok = torch.cuda.is_available()
         if cuda_ok:

@@ -87,8 +87,11 @@ def main() -> None:
     params = info["params"] or 7e9
     use_lora = params > 9e9 or (n_gpus == 1 and params > 4e9)
 
-    lr = 5e-7 * math.sqrt(7e9 / params)
-    lr = min(1e-5, max(3e-7, lr))
+    # DPO LR: the earlier 5e-7 base (peak ~7.6e-7 at 3B) was far too timid —
+    # measured DPO eval loss 0.52 vs the champion's 0.004 on the same task. The
+    # validator ranks on DPO loss alone, so drive the preference margin harder.
+    lr = 3e-6 * math.sqrt(7e9 / params)
+    lr = min(3e-5, max(1e-6, lr)) * float(os.environ.get("SN56_DPO_LR_MULT") or 1.0)
     if use_lora:
         lr *= 4
 

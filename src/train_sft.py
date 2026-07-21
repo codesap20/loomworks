@@ -140,11 +140,14 @@ def main() -> None:
     # 1.018 packed vs 1.024 padded) but HURTS long-sequence tasks (dolly 1.693
     # padded vs 1.704 packed) — long varied docs pack worse / stress varlen. So
     # pack only when the data is short; pad otherwise. Overridable: SN56_PACK=1/0.
+    # The long TAIL is what makes packing hurt (varlen stress on the big docs),
+    # not the median — dolly p95 was only 546 but p99=1148/max=3980 and packing
+    # hurt it, while alpaca is uniformly short and packing helped. Gate on p99.
     _pack_env = os.environ.get("SN56_PACK")
-    _short_data = meta.get("len_p95", 4096) <= 1024
+    _short_data = meta.get("len_p99", 4096) <= 900
     packing = (attn_impl == "flash_attention_2" and not use_kl
                and (_pack_env == "1" or (_pack_env is None and _short_data)))
-    log(f"packing={packing} (len_p95={meta.get('len_p95')}, attn={attn_impl})")
+    log(f"packing={packing} (len_p99={meta.get('len_p99')}, attn={attn_impl})")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     if tokenizer.pad_token_id is None:

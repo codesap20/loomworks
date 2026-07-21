@@ -110,24 +110,20 @@ def main() -> None:
     verifiable = any(k in reward_src for k in
                      ("subprocess", "exec(", "compile(", "assert", "unittest",
                       "== answer", "correct", "test_case", "verify", "sat_", "ded_", "abd_"))
-    unbounded_hack = any(k in reward_src for k in ("len(", "/ (len", "count"))
+    # Base GRPO LR: the champion's open grpo_config.py size table (0-4b 8e-6,
+    # 4-12b 6e-6, 12-15b 5e-6, else lower) — flat, NOT sqrt-scaled. Our old
+    # generic path used ~1.2e-6 (7x too low) + 1 epoch; that badly under-trains
+    # (same failure DPO had). Verifiable/code rewards get a hotter LR (their
+    # separate lrs/grpo_python.json goes up to ~1.6e-3; we stay moderate).
+    pb = params / 1e9
+    grpo_lr = 8e-6 if pb < 4 else 6e-6 if pb < 12 else 5e-6 if pb < 20 else 4e-6
+    beta = 0.5                               # champion default (== validator BETA_GRPO)
     if verifiable:
         beta = 0.1
-        # winners run code-reward LR up to ~1.6e-3 (per-model swept); we can't
-        # sweep locally, so stay in a moderate hot band well short of that.
-        lr_base, lr_hi = 5e-5, 2e-4
-    elif unbounded_hack:
-        beta = 0.12                          # tighter leash vs length/format hacking
-        lr_base, lr_hi = 6e-6, 1.5e-5
-    else:
-        beta = 0.5                           # champion-lineage default for generic rewards
-        lr_base, lr_hi = 8e-7, 1.2e-5
+        grpo_lr = min(2e-4, max(5e-5, grpo_lr * 8))
+    lr = grpo_lr * float(os.environ.get("SN56_GRPO_LR_MULT") or 1.0)
     beta = float(os.environ.get("GRPO_BETA") or beta)
-
-    lr = lr_base * (7e9 / params) ** 0.5
-    lr = min(lr_hi, max(lr_base * 0.5, lr * (3 if use_lora else 1.0)))
-    log(f"reward shape: verifiable={verifiable} unbounded={unbounded_hack} "
-        f"-> beta={beta} lr={lr:.2e}")
+    log(f"reward shape: verifiable={verifiable} -> beta={beta} lr={lr:.2e}")
 
     state = {}
     try:
@@ -137,8 +133,8 @@ def main() -> None:
         pass
     grpo_state = state.get("grpo", {})
     use_vllm = not grpo_state.get("disable_vllm", False)
-    # winners run few generations and spend the budget on more optimizer steps
-    num_generations = grpo_state.get("num_generations", 4)
+    # champion runs 2 generations (spend budget on optimizer steps, not rollouts)
+    num_generations = grpo_state.get("num_generations", 2)
     micro = grpo_state.get("batch_size") or num_generations  # divisible by group
 
     end_ts = args.end_ts
@@ -189,9 +185,12 @@ def main() -> None:
             max_completion_length=max_completion,
             beta=beta,
             learning_rate=lr,
-            lr_scheduler_type="cosine",
+            lr_scheduler_type="cosine_with_min_lr",       # champion
+            lr_scheduler_kwargs={"min_lr_rate": 0.25},
             warmup_ratio=0.03,
-            num_train_epochs=1,
+            num_train_epochs=int(os.environ.get("SN56_GRPO_EPOCHS") or 4),  # champion uses 4
+            weight_decay=0.0,
+            optim="paged_adamw_8bit",                     # champion
             bf16=True,
             tf32=True,
             gradient_checkpointing=params > 2.5e9,

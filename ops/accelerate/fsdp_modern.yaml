@@ -1,18 +1,20 @@
 # Accelerate launch config for the modern venv (torch 2.7.1 / transformers 5.9).
 #
-# FSDP v1, FULL_SHARD across 4xH100. Deliberate choices:
+# FSDP v2 (per-parameter DTensor sharding). Chosen over FSDP1 because FSDP1's
+# flat-parameter writeback (use_orig_params) crashes on the quasar linear-
+# attention params under bf16 mixed precision: "Cannot writeback when the
+# parameter shape changes" (dt_bias / A_log / conv1d.weight get upcast to fp32).
+# FSDP2 shards each parameter as a DTensor, has no writeback-orig-params step,
+# and is the non-deprecated path (torch get_state_dict API).
+#
+# Deliberate choices:
 #  - fsdp_activation_checkpointing: the quasar remote-code stubs out
 #    transformers' GradientCheckpointingLayer, so the model's own
 #    gradient_checkpointing_enable() is a silent no-op. FSDP-side activation
-#    checkpointing wraps the decoder-layer instances externally and works for
-#    any architecture.
-#  - fsdp_use_orig_params: required so the patched loss forward can read
-#    lm_head.weight (cut-cross-entropy) while the root unit is unsharded.
-#  - transformer wrap class is NOT pinned here: train_chat_modern.py detects
-#    the decoder-layer class at runtime (quasar/qwen/MoE generic) and sets
-#    fsdp_plugin.transformer_cls_names_to_wrap before prepare().
-#  - fsdp_cpu_ram_efficient_loading off: every rank loads the full checkpoint
-#    (~440GB host RAM available), avoiding meta-device + remote-code edge cases.
+#    checkpointing wraps the decoder-layer instances externally, arch-agnostic.
+#  - fsdp_reshard_after_forward: true == FULL_SHARD memory behaviour.
+#  - transformer wrap class is NOT pinned here: train_chat_modern.py detects the
+#    decoder-layer class at runtime and sets transformer_cls_names_to_wrap.
 compute_environment: LOCAL_MACHINE
 debug: false
 distributed_type: FSDP
@@ -26,11 +28,10 @@ rdzv_backend: static
 same_network: true
 use_cpu: false
 fsdp_config:
-  fsdp_activation_checkpointing: true
+  fsdp_version: 2
+  fsdp_reshard_after_forward: true
   fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_activation_checkpointing: true
   fsdp_cpu_ram_efficient_loading: false
   fsdp_offload_params: false
-  fsdp_sharding_strategy: FULL_SHARD
   fsdp_state_dict_type: FULL_STATE_DICT
-  fsdp_sync_module_states: false
-  fsdp_use_orig_params: true

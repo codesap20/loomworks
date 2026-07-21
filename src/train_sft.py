@@ -370,7 +370,7 @@ def main() -> None:
         gradient_accumulation_steps=grad_accum,
         num_train_epochs=epoch_cap,
         learning_rate=peak_lr,
-        weight_decay=0.01,
+        weight_decay=float(os.environ.get("SN56_WD") or 0.01),
         max_grad_norm=1.0,
         optim="adamw_torch_fused",
         bf16=True,
@@ -383,7 +383,8 @@ def main() -> None:
         logging_steps=25,
         group_by_length=True,
         length_column_name="length",
-        neftune_noise_alpha=1.0 if len(train_ds) < 20_000 else None,
+        neftune_noise_alpha=(float(os.environ["SN56_NEFTUNE"]) if os.environ.get("SN56_NEFTUNE")
+                             else (1.0 if len(train_ds) < 20_000 else None)),
         deepspeed=ds_cfg,
         report_to=[],
         seed=1337,

@@ -243,6 +243,14 @@ def save_checkpoint(accelerator, model, tokenizer, out_dir, base_dir, tag):
             tokenizer.save_pretrained(tmp_dir)
         except Exception as exc:  # noqa: BLE001
             print(f"[save] tokenizer.save_pretrained failed ({exc}); base copy will cover it", flush=True)
+        # save_pretrained's dynamic-module copy can trace an FSDP2-wrapped model
+        # into torch's FSDP internals and dump _fsdp_*.py / _fully_shard.py into
+        # the repo (pollutes the submission, can trip the readability/is_finetune
+        # checks). Strip EVERY .py it wrote, then copy_aux_files restores only the
+        # base model's audited modeling/configuration .py.
+        for name in os.listdir(tmp_dir):
+            if name.endswith(".py"):
+                os.remove(os.path.join(tmp_dir, name))
         copy_aux_files(base_dir, tmp_dir)
         shutil.rmtree(old_dir, ignore_errors=True)
         if os.path.isdir(out_dir):

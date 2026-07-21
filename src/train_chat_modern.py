@@ -177,9 +177,8 @@ def attach_cce_forward(model, linear_cross_entropy):
         weight = head.weight
         if weight.dtype != hidden.dtype:
             weight = weight.to(hidden.dtype)
-        bias = getattr(head, "bias", None)
         loss = linear_cross_entropy(
-            hidden, weight, labels, bias=bias, shift=1, reduction="mean", impl="cce"
+            hidden, weight, labels, shift=1, reduction="mean", impl="cce"
         )
         return {"loss": loss}
 
@@ -393,11 +392,19 @@ def train(args):
             os.environ["FSDP_TRANSFORMER_CLS_TO_WRAP"] = ",".join(layer_classes)
             log(f"[train] FSDP wrap classes: {layer_classes}")
 
-    linear_cross_entropy = try_setup_cce(model, accelerator.device)
-    use_cce = linear_cross_entropy is not None
-    if use_cce:
-        attach_cce_forward(model, linear_cross_entropy)
-    log(f"[train] loss path: {'cut-cross-entropy' if use_cce else 'model logits CE'}")
+    # Cut-cross-entropy is OFF by default: under FSDP2 the lm_head weight is a
+    # sharded DTensor, and the manual CCE patch multiplies it against plain-tensor
+    # hidden states -> "mixed torch.Tensor and DTensor" crash. The model's native
+    # labels-based loss keeps the lm_head matmul inside the module where FSDP2's
+    # dispatch handles DTensors; full logits for 9B/4096-seq are only ~2GB. Opt in
+    # with SN56_USE_CCE=1 only if you've resolved the DTensor path.
+    use_cce = False
+    if os.environ.get("SN56_USE_CCE") == "1":
+        linear_cross_entropy = try_setup_cce(model, accelerator.device)
+        use_cce = linear_cross_entropy is not None
+        if use_cce:
+            attach_cce_forward(model, linear_cross_entropy)
+    log(f"[train] loss path: {'cut-cross-entropy' if use_cce else 'model native labels-loss'}")
 
     # FSDP2 requires model + optimizer prepared TOGETHER (accelerate remaps the
     # optimizer's param references after the model is converted to DTensors);

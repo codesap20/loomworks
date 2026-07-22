@@ -113,7 +113,17 @@ def main() -> None:
         log("KL task on large model -> switching to LoRA for a free reference")
 
     lora = regime["adapter"]
-    peak_lr = plan_mod.sft_lr(info["params"])
+    # Champion-schedule mode (env-gated experiment): replicate their FULL instruct
+    # package, not just LR — cosine_with_min_lr(0.25) + their LR table +
+    # paged_adamw_8bit + wd 0. Their hot 7.5e-5 only pays off inside this schedule
+    # (LR-in-isolation on our WSD overshot: 1.062 vs our 1.018).
+    champ_sched = os.environ.get("SN56_CHAMP_SCHED") == "1"
+    if champ_sched:
+        pb = (info["params"] or 7e9) / 1e9
+        peak_lr = (1.0e-4 if pb < 2 else 7.5e-5 if pb < 4 else 7.0e-5
+                   if pb < 5 else 3.5e-5 if pb < 9 else 1.0e-4 if pb < 15 else 8.0e-5)
+    else:
+        peak_lr = plan_mod.sft_lr(info["params"])
     if lora:
         peak_lr = min(2.5e-4, peak_lr * 5)
 
@@ -255,6 +265,8 @@ def main() -> None:
             return (loss, outputs) if return_outputs else loss
 
         def create_scheduler(self, num_training_steps, optimizer=None):
+            if champ_sched:   # let TrainingArguments' cosine_with_min_lr take over
+                return super().create_scheduler(num_training_steps, optimizer)
             opt = optimizer or self.optimizer
             self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
                 opt, lambda step: wsd.factor(step))
@@ -382,9 +394,12 @@ def main() -> None:
         gradient_accumulation_steps=grad_accum,
         num_train_epochs=epoch_cap,
         learning_rate=peak_lr,
-        weight_decay=float(os.environ.get("SN56_WD") or 0.01),
+        weight_decay=(0.0 if champ_sched else float(os.environ.get("SN56_WD") or 0.01)),
         max_grad_norm=1.0,
-        optim="adamw_torch_fused",
+        optim=("paged_adamw_8bit" if champ_sched else "adamw_torch_fused"),
+        lr_scheduler_type=("cosine_with_min_lr" if champ_sched else "linear"),
+        lr_scheduler_kwargs=({"min_lr_rate": 0.25} if champ_sched else None),
+        warmup_ratio=(0.03 if champ_sched else 0.0),
         bf16=True,
         tf32=True,
         gradient_checkpointing=(info["params"] or 0) > 2.5e9,

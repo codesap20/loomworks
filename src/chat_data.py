@@ -262,8 +262,12 @@ def prepare_instruct_dataset(tokenizer, data_path, dataset_type_json, seq_len,
         if not any(l != -100 for l in labels):
             skipped += 1
             continue
-        item = {"input_ids": input_ids, "labels": labels,
-                "attention_mask": [1] * len(input_ids)}
+        # numpy arrays (int64) — make_collate does torch.from_numpy, which rejects
+        # plain lists (the chat path uses np.asarray too; this parity was missing
+        # and crashed the pre-boss quasar InstructTextTask at step 0).
+        item = {"input_ids": np.asarray(input_ids, dtype=np.int64),
+                "labels": np.asarray(labels, dtype=np.int64),
+                "attention_mask": np.ones(len(input_ids), dtype=np.int64)}
         if _stable_hash(row) % dev_mod == 0 and len(dev_items) < dev_cap:
             dev_items.append(item)
         else:

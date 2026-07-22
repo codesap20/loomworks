@@ -52,7 +52,10 @@ def build_pairs(data_path: str, dt: dict) -> tuple[list[dict], list[dict]]:
     seen: set[str] = set()
     for row in rows:
         p, c, r = row.get(f_prompt), row.get(f_chosen), row.get(f_rejected)
-        if not p or c is None or r is None or c == r:
+        # drop degenerate pairs: empty prompt/chosen/rejected (no signal) or
+        # identical chosen==rejected (the validator warns these cause random
+        # predictions). `not c`/`not r` catches both None and empty-string.
+        if not p or not c or not r or c == r:
             continue
         pair = {"prompt": str(p), "chosen": str(c), "rejected": str(r)}
         h = hashlib.blake2b(json.dumps(pair, sort_keys=True).encode(), digest_size=10).hexdigest()

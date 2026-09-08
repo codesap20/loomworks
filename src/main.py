@@ -133,8 +133,16 @@ def main() -> None:
                           "--out-dir", tok_dir], end_ts)
                 if rc != 0:
                     return rc
+            # ChatTask (incl. the continuous-SFT boss lineage) trains best under the
+            # champion schedule — measured on Qwen3-4B/14B chat (H200, 2026-09-08):
+            # champ schedule beat our default WSD 770-12 (4B full-ft) and 799-0
+            # (14B LoRA) on the validator's per-sample rule. Instruct keeps WSD
+            # (July: WSD won on alpaca instruct). Overridable via SN56_CHAMP_SCHED.
+            sft_env = None
+            if args.task_type == "ChatTask":
+                sft_env = {"SN56_CHAMP_SCHED": os.environ.get("SN56_CHAMP_SCHED", "1")}
             return run([sys.executable, os.path.join(SRC, "train_sft.py"),
-                        *common, "--tokenized-dir", tok_dir], end_ts)
+                        *common, "--tokenized-dir", tok_dir], end_ts, sft_env)
 
         if args.task_type == "DpoTask":
             return run([sys.executable, os.path.join(SRC, "train_dpo.py"),

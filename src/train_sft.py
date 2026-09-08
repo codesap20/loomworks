@@ -98,6 +98,24 @@ def main() -> None:
 
     train_ds = load_from_disk(os.path.join(args.tokenized_dir, "train"))
     dev_ds = load_from_disk(os.path.join(args.tokenized_dir, "dev"))
+
+    # Dedup the dev split (SN56_DEVDEDUP=1) — exact-duplicate (input_ids, labels)
+    # rows over-weight whatever they duplicate and add noise to checkpoint
+    # selection. The champion dedups its eval split for exactly this reason
+    # (champion/scripts/train_instruct.py). Gated so it can be A/B'd; only ever
+    # shrinks the dev set, never touches training data or the shipped weights
+    # directly. Default off = live behavior unchanged.
+    if os.environ.get("SN56_DEVDEDUP") == "1":
+        seen, keep = set(), []
+        for i, row in enumerate(dev_ds):
+            key = (tuple(row["input_ids"]), tuple(row["labels"]))
+            if key not in seen:
+                seen.add(key)
+                keep.append(i)
+        if len(keep) < len(dev_ds):
+            log(f"dev dedup: {len(dev_ds)} -> {len(keep)}")
+            dev_ds = dev_ds.select(keep)
+
     train_ds = train_ds.map(lambda r: {"length": len(r["input_ids"])})
     with open(os.path.join(args.tokenized_dir, "meta.json")) as f:
         meta = json.load(f)

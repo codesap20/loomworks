@@ -88,9 +88,14 @@ def choose_regime(params: float | None, n_gpus: int, gpu_free_gib: float) -> dic
         return {"adapter": None, "dist": "ddp" if n_gpus > 1 else "single"}
     if need_gib <= capacity:
         return {"adapter": None, "dist": "zero3" if n_gpus > 1 else "single-offload"}
-    # too big to full-ft: high-rank LoRA
+    # too big to full-ft: high-rank LoRA. Multi-GPU MUST shard the frozen base
+    # (zero3) — DDP replicates the full base on every GPU, so a 35-71B boss task
+    # (the new BOSS_ROUND_LARGE_INSTRUCT band) OOMs at load on 80GB H100s and
+    # forfeits. zero3 shards params/grads/optimizer while LoRA keeps the trainable
+    # set tiny; the frozen base is what actually needs the sharding. Single-GPU
+    # can't hold a 30B+ base anyway (validator gives 4-8x here) but keep offload.
     return {"adapter": {"r": 64, "alpha": 128, "dropout": 0.05},
-            "dist": "ddp" if n_gpus > 1 else "single"}
+            "dist": "zero3" if n_gpus > 1 else "single-offload"}
 
 
 def micro_batch_for(params: float | None, seq_len: int, gpu_free_gib: float,

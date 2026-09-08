@@ -297,6 +297,18 @@ def main() -> None:
 
     best = {"loss": float("inf"), "saved_at": 0.0}
 
+    # Per-sample-aware final selection (SN56_SELECT=persample). Knockouts/boss
+    # tasks are now decided PER held-out SAMPLE (win more samples, 0.01-nat
+    # deadzone), not on mean loss — so among candidates tied on mean we prefer the
+    # lightest bad tail (lowest p90 per-sample loss), which wins more samples.
+    # Gated OFF by default (mean); single-GPU + non-zero3 only (per-sample eval
+    # must see the whole dev set on one rank). Bounded by a mean band so it never
+    # ships a worse-on-mean model beyond dev noise (validator: sample winner must
+    # not be worse on the ranking loss).
+    select_mode = os.environ.get("SN56_SELECT", "mean").lower()
+    persample_sel = (select_mode == "persample" and args.num_gpus == 1
+                     and regime["dist"] != "zero3")
+
     # Greedy checkpoint soup (Wortsman 2022): keep the K lowest-dev-loss weight
     # snapshots; at the end greedily average them, accepting a candidate only if
     # held-out dev loss improves (so the soup is never worse than the best single).
@@ -371,6 +383,10 @@ def main() -> None:
                 best["loss"] = loss
                 best["saved_at"] = time.time()
                 best["stale"] = 0
+                if persample_sel:
+                    # keep the best checkpoint in memory too, so per-sample
+                    # selection can compare it against raw/ema without a disk reload
+                    best["state"] = snapshot_trainables(trainer.model)
                 export(trainer, f"best@{tstate.global_step}")
             else:
                 # overfitting guard: once dev loss sits >3% above best for a few
@@ -459,6 +475,28 @@ def main() -> None:
     def eval_now():
         return trainer.evaluate().get("eval_loss", float("inf"))
 
+    def per_sample_ce():
+        """Per-held-out-sample mean CE over completion (label) tokens — the exact
+        quantity the validator compares sample-by-sample. Current model weights."""
+        m = trainer.model
+        m.eval()
+        dev = next(m.parameters()).device
+        out = []
+        with torch.no_grad():
+            for batch in trainer.get_eval_dataloader():
+                ids = batch["input_ids"].to(dev)
+                am = batch.get("attention_mask")
+                am = am.to(dev) if am is not None else None
+                lab = batch["labels"].to(dev)
+                logits = m(input_ids=ids, attention_mask=am).logits
+                sl = logits[:, :-1, :].float()
+                slab = lab[:, 1:]
+                ce = F.cross_entropy(sl.reshape(-1, sl.size(-1)), slab.reshape(-1),
+                                     ignore_index=-100, reduction="none").view(slab.shape)
+                cnt = (slab != -100).sum(1).clamp(min=1)
+                out.append((ce.sum(1) / cnt).float().cpu())
+        return torch.cat(out) if out else torch.tensor([])
+
     raw_state = snapshot_trainables(model)
     raw_loss = eval_now()
     candidates = {"raw": (raw_loss, raw_state)}  # "best" (on disk) is the baseline
@@ -488,16 +526,41 @@ def main() -> None:
             log(f"soup failed ({type(e).__name__}: {e})")
     soup_pool.clear()
 
-    winner = min(candidates.items(), key=lambda kv: kv[1][0])
-    picked, (picked_loss, picked_state) = winner[0], winner[1]
-    log(f"final: best_ondisk={best['loss']:.5f} " +
-        " ".join(f"{k}={v[0]:.5f}" for k, v in candidates.items()) + f" -> pick {picked}")
-    if picked_loss < best["loss"]:
+    if persample_sel and best.get("state") is not None:
+        # make the on-disk best a first-class candidate so the per-sample winner
+        # can't be silently overridden by the mean-gate below
+        candidates.setdefault("best", (best["loss"], best["state"]))
+
+    if persample_sel and len(candidates) > 1:
+        # among candidates statistically tied on mean (within dev noise), ship the
+        # one with the lightest bad tail — it wins more individual held-out samples
+        best_mean = min(v[0] for v in candidates.values())
+        band = max(0.006, best_mean * 0.006)  # ~ observed run-to-run dev noise
+        tails = {}
+        for name, (m, st) in candidates.items():
+            if m <= best_mean + band:
+                load_weights(st)
+                ps = per_sample_ce()
+                tails[name] = float(torch.quantile(ps, 0.90)) if ps.numel() else float("inf")
+        picked = min(tails, key=tails.get)
+        picked_loss, picked_state = candidates[picked]
+        log("persample-select: " + " ".join(
+            f"{k}(mean={candidates[k][0]:.5f},p90={tails[k]:.4f})" for k in tails)
+            + f" -> pick {picked}")
         load_weights(picked_state)
-        best["loss"] = picked_loss
-        export(trainer, f"{picked}-final")
+        best["loss"] = min(best["loss"], picked_loss)
+        export(trainer, f"{picked}-persample")
     else:
-        picked = "best-ondisk"  # the training-time best checkpoint already on disk wins
+        winner = min(candidates.items(), key=lambda kv: kv[1][0])
+        picked, (picked_loss, picked_state) = winner[0], winner[1]
+        log(f"final: best_ondisk={best['loss']:.5f} " +
+            " ".join(f"{k}={v[0]:.5f}" for k, v in candidates.items()) + f" -> pick {picked}")
+        if picked_loss < best["loss"]:
+            load_weights(picked_state)
+            best["loss"] = picked_loss
+            export(trainer, f"{picked}-final")
+        else:
+            picked = "best-ondisk"  # the training-time best checkpoint already on disk wins
     if best["saved_at"] == 0.0 and not os.path.isdir(args.output_dir):
         export(trainer, "fallback-final")
 

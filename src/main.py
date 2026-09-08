@@ -140,7 +140,18 @@ def main() -> None:
             # (July: WSD won on alpaca instruct). Overridable via SN56_CHAMP_SCHED.
             sft_env = None
             if args.task_type == "ChatTask":
-                sft_env = {"SN56_CHAMP_SCHED": os.environ.get("SN56_CHAMP_SCHED", "1")}
+                # Measured chat recipe (Qwen3-4B full-ft chat, H200 2026-09-08,
+                # validator per-sample rule, all vs the champion schedule):
+                #   champ(1.0x)            0.38168  baseline
+                #   +lr 0.85x              0.37330  beats champ 265-57, gap 0.0084
+                #   +lr 0.85x +soup        0.36712  beats champ 381-12, gap 0.0146  <- clears
+                # the boss-round bars (>55% of decided AND >=0.01 mean gap). Hotter LR
+                # (1.25/1.5) and more epochs both LOSE. Overridable per-knob.
+                sft_env = {
+                    "SN56_CHAMP_SCHED": os.environ.get("SN56_CHAMP_SCHED", "1"),
+                    "SN56_LR_MULT": os.environ.get("SN56_LR_MULT", "0.85"),
+                    "SN56_USE_SOUP": os.environ.get("SN56_USE_SOUP", "1"),
+                }
             return run([sys.executable, os.path.join(SRC, "train_sft.py"),
                         *common, "--tokenized-dir", tok_dir], end_ts, sft_env)
 

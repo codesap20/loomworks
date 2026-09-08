@@ -334,8 +334,15 @@ def main() -> None:
     # checkpoints are too correlated to benefit — soup matched (never beat) the
     # best single (1.018 either way) while adding K-snapshot RAM (OOM risk on
     # 7-12B) + eval-noise candidates. Opt in with SN56_USE_SOUP=1.
+    # LoRA snapshots are tiny (adapter only), so souping is cheap and safe there —
+    # the old `lora is None` guard existed only for full-ft RAM cost. Measured on
+    # Qwen3-4B chat (H200): champ+lr0.85+soup beat the champion schedule 381-12 with
+    # a 0.0146 mean gap (clears the boss-round 0.01 bar), vs 0.0084 for lr0.85 alone
+    # — the soup IS the winning margin. NOTE: still unavailable under zero3 (sharded
+    # weights), which is exactly the validator's 14B continuous-SFT regime; closing
+    # that is the remaining gap (see notes/scoring-2026-09.md).
     soup_enabled = (os.environ.get("SN56_USE_SOUP") == "1"
-                    and regime["dist"] in ("single", "ddp") and lora is None)
+                    and regime["dist"] in ("single", "ddp"))
     soup_k = 4
     soup_pool: list[tuple[float, dict]] = []  # (dev_loss, {name: bf16 cpu tensor})
 

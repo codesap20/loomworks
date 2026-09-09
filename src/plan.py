@@ -119,6 +119,11 @@ def choose_regime(params: float | None, n_gpus: int, gpu_free_gib: float) -> dic
         regime["adapter"] = {"r": 64, "alpha": 128, "dropout": 0.05}
     elif adapter == "none":
         regime["adapter"] = None
+    # SN56_LORA_R overrides the rank (alpha tracks 2r unless SN56_LORA_ALPHA is set)
+    r = os.environ.get("SN56_LORA_R")
+    if r and regime.get("adapter"):
+        regime["adapter"]["r"] = int(r)
+        regime["adapter"]["alpha"] = int(os.environ.get("SN56_LORA_ALPHA") or 2 * int(r))
     return regime
 
 

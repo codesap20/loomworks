@@ -690,15 +690,31 @@ def main() -> None:
                 eng.optimizer.parameter_offload.get_param_coordinator().release_and_reset_all(eng.module)
             except Exception as e2:
                 log(f"zero3 quiesce failed ({type(e1).__name__}: {e1}; {type(e2).__name__}: {e2})")
+        # PEFT names a live parameter "...lora_A.<adapter>.weight" but SAVES it as
+        # "...lora_A.weight", so a disk slot never matches named_parameters() directly.
+        # Measured: 0 of 902 params matched a 504-key adapter state before this.
+        import re as _re
+        _adapter = getattr(model, "active_adapter", None) or "default"
+        if isinstance(_adapter, (list, tuple)):
+            _adapter = _adapter[0] if _adapter else "default"
+
+        def _lookup(name):
+            if state is None:
+                return None
+            if name in state:
+                return state[name]
+            # drop the adapter-name segment wherever PEFT inserted it
+            return state.get(_re.sub(rf"\.{_re.escape(str(_adapter))}\.", ".", name))
+
         matched = [0, 0]
         with torch.no_grad():
             for n, p in model.named_parameters():
                 with deepspeed.zero.GatheredParameters([p], modifier_rank=0):
+                    src = _lookup(n) if is_main else None
                     if is_main and state is not None:
                         matched[1] += 1
-                        matched[0] += 1 if n in state else 0
-                    if is_main and state is not None and n in state:
-                        src = state[n]
+                        matched[0] += 1 if src is not None else 0
+                    if is_main and src is not None:
                         if tuple(src.shape) != tuple(p.shape):
                             raise RuntimeError(
                                 f"zero3 load shape mismatch at {n}: param {tuple(p.shape)} "

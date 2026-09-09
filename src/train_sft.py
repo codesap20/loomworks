@@ -495,6 +495,7 @@ def main() -> None:
         if is_main:
             tokenizer.save_pretrained(args.output_dir)
             _patch_architectures(args.output_dir, info["architectures"])
+            paths.patch_adapter_base(args.output_dir, args.base_model_id)
             log(f"exported ({tag}) dev_loss={best['loss']:.5f}")
 
     class ClockCallback(TrainerCallback):

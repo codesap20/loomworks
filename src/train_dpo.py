@@ -171,6 +171,7 @@ def main() -> None:
         trainer.save_model(args.output_dir)
         if is_main:
             tokenizer.save_pretrained(args.output_dir)
+            paths.patch_adapter_base(args.output_dir, args.base_model_id)
             log(f"exported {tag} (dev_loss={best['loss']:.5f})")
 
     probing = {"on": False}   # True while the LR search runs its probe trainings

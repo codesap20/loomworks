@@ -133,25 +133,27 @@ def main() -> None:
                           "--out-dir", tok_dir], end_ts)
                 if rc != 0:
                     return rc
-            # ChatTask (incl. the continuous-SFT boss lineage) trains best under the
-            # champion schedule — measured on Qwen3-4B/14B chat (H200, 2026-09-08):
-            # champ schedule beat our default WSD 770-12 (4B full-ft) and 799-0
-            # (14B LoRA) on the validator's per-sample rule. Instruct keeps WSD
-            # (July: WSD won on alpaca instruct). Overridable via SN56_CHAMP_SCHED.
-            sft_env = None
+            # ChatTask keeps the champion's cosine schedule and instruct keeps our WSD,
+            # but both are now known to be a wash at the real budget (see below) — the
+            # split is kept only because each was measured in its own regime.
+            # Checkpoint soup is the ONE mechanism that survives training to
+            # convergence, so it is on for both SFT-shaped task types. Measured on
+            # H200 2026-09-09 with the validator's per-sample rule, every arm run to
+            # the epoch cap (~1.5 epochs before the overfitting early-stop):
+            #   instruct  champ sched 0.95719 | our WSD 0.95713 (gap 0.00006, a wash)
+            #                                 | our WSD + soup 0.95207 -> beats champ
+            #                                   by 0.0051, 303-143 of decided samples
+            #   chat      champ sched 0.34225 | +lr 0.85x +soup 0.34182 (gap 0.0004)
+            #                                 | +lr 1.0x  +soup 0.34081 (gap 0.0014)
+            # The earlier, much larger margins (instruct 504-158, chat 381-12) were all
+            # measured at 700-800s = ~0.5 epoch. The validator sizes budgets for 2 epochs
+            # (TARGET_TRAINING_EPOCHS), so those runs were in a regime it never uses, and
+            # the schedule/LR differences vanish once both sides converge. In particular
+            # the old chat default of lr x0.85 is WORSE at the real budget than x1.0.
+            sft_env = {"SN56_USE_SOUP": os.environ.get("SN56_USE_SOUP", "1")}
             if args.task_type == "ChatTask":
-                # Measured chat recipe (Qwen3-4B full-ft chat, H200 2026-09-08,
-                # validator per-sample rule, all vs the champion schedule):
-                #   champ(1.0x)            0.38168  baseline
-                #   +lr 0.85x              0.37330  beats champ 265-57, gap 0.0084
-                #   +lr 0.85x +soup        0.36712  beats champ 381-12, gap 0.0146  <- clears
-                # the boss-round bars (>55% of decided AND >=0.01 mean gap). Hotter LR
-                # (1.25/1.5) and more epochs both LOSE. Overridable per-knob.
-                sft_env = {
-                    "SN56_CHAMP_SCHED": os.environ.get("SN56_CHAMP_SCHED", "1"),
-                    "SN56_LR_MULT": os.environ.get("SN56_LR_MULT", "0.85"),
-                    "SN56_USE_SOUP": os.environ.get("SN56_USE_SOUP", "1"),
-                }
+                sft_env["SN56_CHAMP_SCHED"] = os.environ.get("SN56_CHAMP_SCHED", "1")
+                sft_env["SN56_LR_MULT"] = os.environ.get("SN56_LR_MULT", "1.0")
             return run([sys.executable, os.path.join(SRC, "train_sft.py"),
                         *common, "--tokenized-dir", tok_dir], end_ts, sft_env)
 

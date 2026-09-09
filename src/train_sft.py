@@ -414,7 +414,14 @@ def main() -> None:
     # missing from this list, which silently disabled soup on the 14B LoRA test.
     soup_enabled = (os.environ.get("SN56_USE_SOUP") == "1"
                     and regime["dist"] in ("single", "single-offload", "ddp", "zero3"))
-    soup_k = 4
+    soup_k = int(os.environ.get("SN56_SOUP_K") or 4)
+    # evals per run and the early-stop patience move together: at 2x the eval
+    # density, 3 stale evals is half as much training as before, so scale it.
+    evals_per_run = int(os.environ.get("SN56_EVALS_PER_RUN") or 12)
+    stale_patience = max(3, round(3 * evals_per_run / 12))
+    # the floor scales with density so the default (12) keeps its old value of 12
+    # and a denser setting is not silently clamped back to it
+    eval_floor = max(2, round(144 / max(1, evals_per_run)))
     soup_pool: list[tuple[float, dict]] = []  # (dev_loss, {name: bf16 cpu tensor})
     # zero3: weights are partitioned, so RAM snapshots are meaningless. Instead each
     # new-best export() (which already gathers the full weights to disk) is copied
@@ -494,8 +501,10 @@ def main() -> None:
                 planned["total"] = max(step + 8, min(steps_per_epoch * epoch_cap, achievable))
                 wsd.decay_start = int(planned["total"] * 0.72)
                 wsd.decay_len = planned["total"] - wsd.decay_start
-                # eval ~12x/run so the early dev-loss minimum is actually sampled
-                targs.eval_steps = max(12, planned["total"] // 12)
+                # eval N times per run. Denser evals cost ~10s each but give the soup
+                # more (and less correlated) candidates, a finer best-checkpoint and a
+                # finer early-stop — soup is the only lever that survives convergence.
+                targs.eval_steps = max(eval_floor, planned["total"] // evals_per_run)
                 if hasattr(tstate, "eval_steps"):
                     tstate.eval_steps = targs.eval_steps
                 log(f"replan: t/step={self.t_per_step:.2f}s total={planned['total']} "
@@ -532,7 +541,7 @@ def main() -> None:
                 # the best. Frees the remaining budget and avoids shipping a worse
                 # late checkpoint.
                 best["stale"] = best.get("stale", 0) + 1
-                if loss > best["loss"] * 1.03 and best["stale"] >= 3:
+                if loss > best["loss"] * 1.03 and best["stale"] >= stale_patience:
                     log(f"early-stop: dev {loss:.4f} > best {best['loss']:.4f} x1.03 "
                         f"for {best['stale']} evals")
                     control.should_training_stop = True

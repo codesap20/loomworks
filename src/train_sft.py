@@ -239,6 +239,70 @@ def main() -> None:
             peak_lr = lr_probe.lr_range_probe(model, probe_batches, peak_lr, log=log)
         except Exception as e:
             log(f"lr probe failed ({type(e).__name__}: {e}); heuristic LR {peak_lr:.2e}")
+    # ---- budgeted LR search (dev-scored) ---------------------------------- #
+    # The champion runs a per-task LR search on every non-DeepSpeed task and only
+    # falls back to its size-bucket table under DeepSpeed (see notes). A fixed
+    # table cannot match a searched LR, and our own sweeps showed the per-task
+    # optimum moves in opposite directions by task. Gated ON with SN56_LR_SEARCH=1
+    # until validated; skipped whenever it cannot pay for itself.
+    lr_search_frac = float(os.environ.get("SN56_LR_SEARCH_FRAC") or 0.15)
+    if (os.environ.get("SN56_LR_SEARCH") == "1" and world == 1
+            and regime["dist"] not in ("zero3",) and not use_kl
+            and len(train_ds) >= 200 and len(dev_ds) >= 16):
+        import lr_search
+        if torch.cuda.is_available():
+            model.cuda()
+        # match the real run's memory profile, or the probe OOMs at a micro-batch
+        # that training would have handled
+        _ckpt = (info["params"] or 0) > 2.5e9
+        if _ckpt:
+            model.config.use_cache = False
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        # save_margin is set below; the search only runs off-zero3, where it is 300
+        _margin = int(os.environ.get("SN56_SAVE_MARGIN") or 300)
+        budget_s = args.end_ts - time.time() - _margin
+        n_cand = int(os.environ.get("SN56_LR_SEARCH_N") or 4)
+        # Probe depth: enough steps to separate LRs, bounded by the search budget.
+        # Skip entirely unless the whole search costs less than lr_search_frac of
+        # what is left AND the real run still gets its planned epochs.
+        t_step_guess = float(os.environ.get("SN56_T_STEP_GUESS") or 0.0)
+        probe_steps = int(os.environ.get("SN56_LR_SEARCH_STEPS") or 24)
+        try:
+            probe_batches, dev_probe = [], []
+            order = list(range(len(train_ds)))
+            for i in range(probe_steps * grad_accum + 4):
+                rows = [train_ds[order[(i * micro_bs + j) % len(train_ds)]]
+                        for j in range(micro_bs)]
+                probe_batches.append(train_collator(rows))
+                if len(probe_batches) >= 64:      # cycle rather than hoard RAM
+                    break
+            n_dev = min(len(dev_ds), max(16, min(96, len(dev_ds))))
+            for i in range(0, n_dev, max(1, micro_bs)):
+                rows = [dev_ds[j] for j in range(i, min(i + micro_bs, n_dev))]
+                dev_probe.append(pad_collator(rows))
+
+            def _opt_factory(lr):
+                decay = 0.0 if champ_sched else float(os.environ.get("SN56_WD") or 0.01)
+                params = [p for p in model.parameters() if p.requires_grad]
+                return torch.optim.AdamW(params, lr=lr, weight_decay=decay, betas=(0.9, 0.999))
+
+            t0 = time.time()
+            deadline = t0 + max(60.0, budget_s * lr_search_frac)
+            peak_lr, _info = lr_search.search(
+                model, probe_batches, dev_probe, peak_lr,
+                steps=probe_steps, accum=grad_accum, opt_factory=_opt_factory,
+                deadline=deadline, n_candidates=n_cand, log=log)
+            log(f"lr-search: chose {peak_lr:.2e} in {time.time() - t0:.0f}s "
+                f"(budget {deadline - t0:.0f}s of {budget_s:.0f}s left)")
+        except Exception as e:
+            log(f"lr search failed ({type(e).__name__}: {e}); heuristic LR {peak_lr:.2e}")
+        finally:
+            if _ckpt:
+                try:
+                    model.gradient_checkpointing_disable()
+                except Exception:
+                    pass
+
     # Small datasets overfit fast (measured: 3B/alpaca hit its dev-loss floor at
     # ~0.5 epoch then degraded for 3.5 more). Cap epochs tighter for small data
     # and lean on the overfitting early-stop below. Env-overridable for sweeps.

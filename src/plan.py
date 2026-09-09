@@ -110,6 +110,15 @@ def choose_regime(params: float | None, n_gpus: int, gpu_free_gib: float) -> dic
     forced = os.environ.get("SN56_FORCE_DIST")
     if forced:
         regime["dist"] = forced
+    # SN56_FORCE_ADAPTER=lora|none exercises the other side of the full-ft/LoRA
+    # decision on hardware that would not pick it (the champion runs LoRA on every
+    # model >=9B, including the 14B continuous-SFT gate, while our memory rule picks
+    # full-ft there; this makes the two comparable on one GPU). Never set in production.
+    adapter = os.environ.get("SN56_FORCE_ADAPTER")
+    if adapter == "lora":
+        regime["adapter"] = {"r": 64, "alpha": 128, "dropout": 0.05}
+    elif adapter == "none":
+        regime["adapter"] = None
     return regime
 
 

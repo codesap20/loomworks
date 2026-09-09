@@ -170,6 +170,8 @@ def main() -> None:
             tokenizer.save_pretrained(args.output_dir)
             log(f"exported {tag} (dev_loss={best['loss']:.5f})")
 
+    probing = {"on": False}   # True while the LR search runs its probe trainings
+
     class Clock(TrainerCallback):
         def on_step_end(self, targs, tstate, control, **kw):
             if time.time() > end_ts - save_margin:
@@ -179,6 +181,8 @@ def main() -> None:
 
         def on_evaluate(self, targs, tstate, control, metrics=None, **kw):
             loss = (metrics or {}).get("eval_loss")
+            if probing["on"]:
+                return
             if loss is not None and loss < best["loss"] * 0.9995:
                 best["loss"] = loss
                 export(trainer, f"best@{tstate.global_step}")
@@ -223,6 +227,70 @@ def main() -> None:
         peft_config=peft_config,
         callbacks=[Clock()],
     )
+
+    # ---- per-task LR search on HELD-OUT DPO loss --------------------------- #
+    # DPO is the most LR-sensitive task: the training loss has a degenerate
+    # minimiser (a too-hot LR collapses the policy's log-probs to inflate the
+    # chosen-rejected margin, so training loss falls while the model degrades),
+    # and the validator ranks on held-out DPO loss instead. So every probe here is
+    # scored with trainer.evaluate() — TRL's own loss on our dev split, the exact
+    # quantity the validator computes — and the pick is a plain argmin with no
+    # bias toward hotter LRs. Our fixed multiplier was tuned on ONE synthetic
+    # dataset at epoch 0.35; a search transfers to datasets we have never seen.
+    # Gated ON with SN56_DPO_LR_SEARCH=1 until validated.
+    if os.environ.get("SN56_DPO_LR_SEARCH") == "1" and args.num_gpus == 1:
+        import lr_search
+        probe_steps = int(os.environ.get("SN56_DPO_SEARCH_STEPS") or 20)
+        n_cand = int(os.environ.get("SN56_DPO_SEARCH_N") or 4)
+        frac = float(os.environ.get("SN56_DPO_SEARCH_FRAC") or 0.15)
+        budget_s = end_ts - time.time() - save_margin
+        deadline = time.time() + max(60.0, budget_s * frac)
+        cands = lr_search.candidate_lrs(lr, n_cand, 0.3)
+        log(f"dpo lr-search: candidates {[f'{c:.2e}' for c in cands]} x {probe_steps} steps")
+        snap = {n: p.detach().to("cpu", copy=True)
+                for n, p in trainer.model.named_parameters() if p.requires_grad}
+
+        def _restore():
+            with torch.no_grad():
+                for n, p in trainer.model.named_parameters():
+                    if p.requires_grad and n in snap:
+                        p.copy_(snap[n].to(p.device, p.dtype))
+
+        results = {}
+        probing["on"] = True
+        saved_max_steps, saved_lr = cfg.max_steps, cfg.learning_rate
+        try:
+            for c in cands:
+                if time.time() > deadline:
+                    log("dpo lr-search: out of budget; using what was measured")
+                    break
+                _restore()
+                # a fresh optimizer + scheduler per candidate, or probe N inherits
+                # probe N-1's Adam moments and decayed schedule
+                trainer.optimizer, trainer.lr_scheduler = None, None
+                trainer.args.max_steps = probe_steps
+                trainer.args.learning_rate = c
+                trainer.train()
+                dl = trainer.evaluate().get("eval_loss", float("inf"))
+                results[c] = dl
+                log(f"dpo lr-search: lr={c:.2e} held-out dpo_loss={dl:.5f}")
+        except Exception as e:
+            log(f"dpo lr-search failed ({type(e).__name__}: {e}); keeping {lr:.2e}")
+        finally:
+            _restore()
+            del snap
+            torch.cuda.empty_cache()
+            probing["on"] = False
+            trainer.optimizer, trainer.lr_scheduler = None, None
+            trainer.args.max_steps = saved_max_steps
+            finite = {k: v for k, v in results.items() if v == v and v != float("inf")}
+            if finite:
+                lr = min(finite, key=finite.get)
+                log(f"dpo lr-search: chose {lr:.2e} (held-out {finite[lr]:.5f})")
+            else:
+                lr = saved_lr
+            trainer.args.learning_rate = lr
+            cfg.learning_rate = lr
 
     try:
         trainer.train()

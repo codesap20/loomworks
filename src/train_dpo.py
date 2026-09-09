@@ -106,11 +106,13 @@ def main() -> None:
     # Measured on Qwen3-4B (H200, 2026-09-09) with the validator's exact DPO loss:
     # the champion-matched table alone is too COLD. mean DPO loss by multiplier:
     #   0.50 -> 0.04834 | 0.75 -> 0.02787 | 1.00 -> 0.01756 (old default)
-    #   1.50 -> 0.00856 (beats 1.00 by 27-2 per-pair)  <- best mean, new default
-    #   2.00 -> 0.00935 (more pair wins but WORSE mean, and the rule requires the
-    #                    sample winner not be worse on the ranking loss)
-    # Halves our DPO loss. Note chat wanted COOLER lr (0.85x) while DPO wants HOTTER.
-    lr *= float(os.environ.get("SN56_DPO_LR_MULT") or 1.5)
+    #   1.25 -> 0.01246 | 1.50 -> 0.00856 | 1.75 -> 0.00739  <- minimum, new default
+    #   2.00 -> 0.00935 (more pair wins vs 1.75 but WORSE mean; the rule requires the
+    #                    sample winner not be worse on the ranking loss, so rejected)
+    # 1.75x cuts DPO loss 58% vs the old 1.0x default (0.01756 -> 0.00739).
+    # Note chat wanted COOLER lr (0.85x) while DPO wants HOTTER (1.75x) — the
+    # champion's single size-bucketed table is optimal for neither task.
+    lr *= float(os.environ.get("SN56_DPO_LR_MULT") or 1.75)
     if use_lora:
         lr *= 4
 

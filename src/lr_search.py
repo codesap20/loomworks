@@ -165,12 +165,17 @@ def search(model, train_batches: list, dev_batches: list, center_lr: float, *,
     snap = _snapshot(model)
     results: dict[float, float] = {}
     try:
+        cost = 0.0
         for lr in lrs:
-            if time.time() > deadline:
+            # cost-aware: stop before starting a probe that cannot finish, rather than
+            # discovering the overrun afterwards (which shipped a 1-candidate "search")
+            if time.time() + cost > deadline:
                 log("lr-search: out of budget; keeping the candidates measured so far")
                 break
+            t0 = time.time()
             _restore(model, snap)
             ok = _train_candidate(model, train_batches, lr, steps, accum, opt_factory, log)
+            cost = max(cost, time.time() - t0)
             if not ok:
                 results[lr] = float("inf")
                 continue

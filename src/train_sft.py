@@ -288,6 +288,10 @@ def main() -> None:
 
             t0 = time.time()
             deadline = t0 + max(60.0, budget_s * lr_search_frac)
+            # Measured 2026-09-09: one candidate at 24 steps x accum cost 583s against a
+            # 403s allowance, so the search "finished" having tested a single LR and
+            # shipped it. Probe depth must be sized from the real per-step cost, and the
+            # whole thing skipped when even a minimal search cannot fit.
             peak_lr, _info = lr_search.search(
                 model, probe_batches, dev_probe, peak_lr,
                 steps=probe_steps, accum=grad_accum, opt_factory=_opt_factory,

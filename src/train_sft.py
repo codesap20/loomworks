@@ -252,6 +252,9 @@ def main() -> None:
     lr_mult = float(os.environ.get("SN56_LR_MULT") or 1.0)
     peak_lr *= lr_mult
     save_margin = 300 + (600 if regime["dist"] == "zero3" else 0)
+    # test-only: lets a short local run exercise the end-of-run soup/select path
+    # (zero3's 900s margin would otherwise need a >30min budget). Never set in prod.
+    save_margin = int(os.environ.get("SN56_SAVE_MARGIN") or save_margin)
 
     wsd = WsdPlan(warmup_steps=max(4, int(0.02 * steps_per_epoch * 2)))
     planned = {"total": steps_per_epoch * epoch_cap}
@@ -314,6 +317,7 @@ def main() -> None:
                         ema[name] = cpu.clone()
 
     best = {"loss": float("inf"), "saved_at": 0.0}
+    final_phase = {"on": False}  # set once training ends: on_evaluate goes inert
 
     # Per-sample-aware final selection (SN56_SELECT=persample). Knockouts/boss
     # tasks are now decided PER held-out SAMPLE (win more samples, 0.01-nat
@@ -341,17 +345,59 @@ def main() -> None:
     # — the soup IS the winning margin. NOTE: still unavailable under zero3 (sharded
     # weights), which is exactly the validator's 14B continuous-SFT regime; closing
     # that is the remaining gap (see notes/scoring-2026-09.md).
+    # "single-offload" is the 1-GPU large-LoRA regime (e.g. 14B on one H200); its
+    # snapshots are adapter-only and tiny, so in-RAM soup is fine there. It was
+    # missing from this list, which silently disabled soup on the 14B LoRA test.
     soup_enabled = (os.environ.get("SN56_USE_SOUP") == "1"
-                    and regime["dist"] in ("single", "ddp"))
+                    and regime["dist"] in ("single", "single-offload", "ddp", "zero3"))
     soup_k = 4
     soup_pool: list[tuple[float, dict]] = []  # (dev_loss, {name: bf16 cpu tensor})
+    # zero3: weights are partitioned, so RAM snapshots are meaningless. Instead each
+    # new-best export() (which already gathers the full weights to disk) is copied
+    # into a rotating slot; the final greedy soup reads the slots back on rank 0 and
+    # loads candidates into the sharded model param-by-param (GatheredParameters),
+    # so the existing collective evaluate() loop works unchanged. Every rank keeps the
+    # same slot list (losses are all-reduced), only rank 0 touches files.
+    soup_disk = soup_enabled and regime["dist"] == "zero3"
+    soup_slot_root = os.path.join(paths.WORK_ROOT, "soup_slots", args.task_id)
+    soup_slots: list[tuple[float, str]] = []  # (dev_loss, slot_dir), best first
+
+    def _weight_files(d):
+        return [f for f in os.listdir(d) if f.endswith(".safetensors") or f == "model.safetensors.index.json"]
+
+    def slot_export(loss: float) -> None:
+        """Copy the just-exported full weights into a soup slot (rank 0 files only)."""
+        if not soup_disk:
+            return
+        if len(soup_slots) >= soup_k and loss >= soup_slots[-1][0]:
+            return
+        slot = os.path.join(soup_slot_root, f"s{len(soup_slots)}_{int(time.time())}")
+        if is_main:
+            try:
+                need = sum(os.path.getsize(os.path.join(args.output_dir, f))
+                           for f in _weight_files(args.output_dir))
+                if shutil.disk_usage(paths.WORK_ROOT).free < need * 1.2:
+                    log("soup slot skipped: low disk")
+                    return
+                os.makedirs(slot, exist_ok=True)
+                for f in _weight_files(args.output_dir):
+                    shutil.copy2(os.path.join(args.output_dir, f), os.path.join(slot, f))
+            except Exception as e:
+                log(f"soup slot copy failed ({type(e).__name__}: {e})")
+                return
+        soup_slots.append((loss, slot))
+        soup_slots.sort(key=lambda x: x[0])
+        for _, old in soup_slots[soup_k:]:
+            if is_main:
+                shutil.rmtree(old, ignore_errors=True)
+        del soup_slots[soup_k:]
 
     def snapshot_trainables(mdl):
         return {n: p.detach().to("cpu", torch.bfloat16)
                 for n, p in mdl.named_parameters() if p.requires_grad}
 
     def maybe_pool(mdl, loss):
-        if not soup_enabled:
+        if not soup_enabled or soup_disk:
             return
         if len(soup_pool) < soup_k or loss < max(l for l, _ in soup_pool):
             soup_pool.append((loss, snapshot_trainables(mdl)))
@@ -399,7 +445,9 @@ def main() -> None:
 
         def on_evaluate(self, targs, tstate, control, metrics=None, **kw):
             loss = (metrics or {}).get("eval_loss")
-            if loss is None:
+            if loss is None or final_phase["on"]:
+                # final selection re-uses trainer.evaluate(); those readings must not
+                # pool/slot/export/early-stop — the final block exports the winner itself
                 return
             maybe_pool(trainer.model, loss)
             if loss < best["loss"] * 0.999:
@@ -413,6 +461,7 @@ def main() -> None:
                     # selection can compare it against raw/ema without a disk reload
                     best["state"] = snapshot_trainables(trainer.model)
                 export(trainer, f"best@{tstate.global_step}")
+                slot_export(loss)
             else:
                 # overfitting guard: once dev loss sits >3% above best for a few
                 # consecutive evals, more training only degrades — stop and keep
@@ -460,6 +509,15 @@ def main() -> None:
         dataloader_num_workers=2,
     )
 
+    # Dev metric. HF's eval_loss is token-weighted (long samples dominate); the
+    # validator scores the MEAN OF PER-SAMPLE CE and counts per-sample wins.
+    # Measured 2026-09-09 (4B chat): the two orderings can flip by ~0.01 between
+    # checkpoints, so selecting on the token-weighted number can pick a checkpoint
+    # the validator ranks lower. SN56_DEV_METRIC=persample makes every dev reading
+    # (best-ckpt, early-stop, soup acceptance, final pick) the validator's mean,
+    # computed inside the normal eval pass (no extra forward). Default unchanged.
+    dev_metric = os.environ.get("SN56_DEV_METRIC", "tokw")
+
     class SftTrainer(trainer_cls):
         def get_eval_dataloader(self, eval_dataset=None):
             # eval must not be packed: loss weighting would differ from the validator
@@ -468,6 +526,36 @@ def main() -> None:
                 return super().get_eval_dataloader(eval_dataset)
             finally:
                 self.data_collator = keep
+
+        def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+            if dev_metric != "persample":
+                return super().prediction_step(model, inputs, prediction_loss_only,
+                                               ignore_keys=ignore_keys)
+            inputs = self._prepare_inputs(inputs)
+            labels = inputs["labels"]
+            with torch.no_grad():
+                out = model(**{k: v for k, v in inputs.items() if k != "labels"})
+                sl = out.logits[:, :-1, :].float()
+                slab = labels[:, 1:]
+                ce = F.cross_entropy(sl.reshape(-1, sl.size(-1)), slab.reshape(-1),
+                                     ignore_index=-100, reduction="none").view(slab.shape)
+                mask = slab != -100
+                ps = ce.sum(1) / mask.sum(1).clamp(min=1)          # per-sample mean CE
+                loss = ce.sum() / mask.sum().clamp(min=1)          # token-weighted (kept)
+            # per-sample losses ride along as "predictions" so the standard loop
+            # gathers them across ranks (ddp/zero3) for us
+            return loss.detach(), ps.detach().unsqueeze(1), None
+
+        def evaluation_loop(self, *a, **k):
+            out = super().evaluation_loop(*a, **k)
+            if dev_metric == "persample" and out.predictions is not None:
+                import numpy as np
+                ps = np.asarray(out.predictions, dtype=np.float64).reshape(-1)
+                if ps.size:
+                    out.metrics["eval_loss_tokw"] = out.metrics.get("eval_loss")
+                    out.metrics["eval_loss"] = float(ps.mean())
+                    out.metrics["eval_n"] = int(ps.size)
+            return out
 
     trainer = SftTrainer(
         model=model,
@@ -488,14 +576,56 @@ def main() -> None:
         raise
 
     # ---- final selection: best-on-disk vs raw vs EMA vs greedy soup -------- #
+    final_phase["on"] = True
     # Measure every candidate as a pure dev-loss reading (each restores a known
     # state), then load + export the single winner once. `best` (the lowest
     # checkpoint seen during training) is already on disk as the safe default.
     def load_weights(state):
+        if regime["dist"] == "zero3":
+            return load_weights_zero3(state)
         with torch.no_grad():
             for n, p in model.named_parameters():
                 if p.requires_grad and n in state:
                     p.copy_(state[n].to(p.device, p.dtype))
+
+    def load_weights_zero3(state):
+        """Load a full state_dict into a ZeRO-3 partitioned model, one param at a
+        time (only one gathered tensor lives at once). Collective: every rank must
+        call it; only rank 0 needs `state` populated (modifier_rank broadcasts)."""
+        import deepspeed
+        # Quiesce first: ZeRO-3's prefetch coordinator leaves params INFLIGHT after
+        # the last forward, and GatheredParameters' exit re-partition asserts on
+        # them ("Cannot partition a param in flight"). empty_partition_cache()
+        # (public engine API) partitions everything and resets that state.
+        eng = getattr(trainer, "deepspeed", None) or getattr(trainer, "model_wrapped", None)
+        try:
+            eng.empty_partition_cache()
+        except Exception as e1:
+            try:
+                eng.optimizer.parameter_offload.get_param_coordinator().release_and_reset_all(eng.module)
+            except Exception as e2:
+                log(f"zero3 quiesce failed ({type(e1).__name__}: {e1}; {type(e2).__name__}: {e2})")
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                with deepspeed.zero.GatheredParameters([p], modifier_rank=0):
+                    if is_main and state is not None and n in state:
+                        src = state[n]
+                        if tuple(src.shape) != tuple(p.shape):
+                            raise RuntimeError(
+                                f"zero3 load shape mismatch at {n}: param {tuple(p.shape)} "
+                                f"(ds_status={getattr(p, 'ds_status', None)}) vs state {tuple(src.shape)}")
+                        p.copy_(src.to(p.device, p.dtype))
+
+    def load_slot_state(slot_dir):
+        """rank 0: read a slot's safetensors into a CPU fp32 dict; others: None."""
+        if not is_main:
+            return None
+        from safetensors.torch import load_file
+        out = {}
+        for f in sorted(_weight_files(slot_dir)):
+            if f.endswith(".safetensors"):
+                out.update({k: v.to(torch.float32) for k, v in load_file(os.path.join(slot_dir, f)).items()})
+        return out
 
     def eval_now():
         return trainer.evaluate().get("eval_loss", float("inf"))
@@ -522,33 +652,54 @@ def main() -> None:
                 out.append((ce.sum(1) / cnt).float().cpu())
         return torch.cat(out) if out else torch.tensor([])
 
-    raw_state = snapshot_trainables(model)
-    raw_loss = eval_now()
-    candidates = {"raw": (raw_loss, raw_state)}  # "best" (on disk) is the baseline
+    candidates = {}  # "best" (on disk) is the baseline
+    if regime["dist"] != "zero3":
+        # under zero3 the RAM snapshot is sharded placeholders and the last
+        # on_evaluate already exported these weights if they were the best
+        raw_state = snapshot_trainables(model)
+        raw_loss = eval_now()
+        candidates["raw"] = (raw_loss, raw_state)
 
     have_budget = time.time() < args.end_ts - save_margin
     if ema_enabled and ema and have_budget:
         load_weights(ema)
         candidates["ema"] = (eval_now(), {n: t.clone() for n, t in ema.items()})
 
+    if soup_disk and len(soup_slots) >= 2 and have_budget:
+        # materialise the disk slots as the pool (rank 0 holds tensors, others None;
+        # the loop structure below is identical on every rank so collectives line up)
+        soup_pool = [(l, load_slot_state(d)) for l, d in soup_slots]
+        log(f"soup: materialised {len(soup_pool)} disk slots "
+            f"(losses {' '.join(f'{l:.5f}' for l, _ in soup_pool)})")
     if soup_enabled and len(soup_pool) >= 2 and have_budget:
         try:
-            running = {n: t.to(torch.float32).clone() for n, t in soup_pool[0][1].items()}
+            def _f32(d):
+                return None if d is None else {n: t.to(torch.float32).clone() for n, t in d.items()}
+            running = _f32(soup_pool[0][1])
             load_weights(running)
             soup_loss = eval_now()
             n_accepted = 1
             for _, cand in soup_pool[1:]:
-                trial = {n: (running[n] * n_accepted + cand[n].to(torch.float32)) / (n_accepted + 1)
-                         for n in running}
+                if running is not None:
+                    for n in running:
+                        if n not in cand or tuple(cand[n].shape) != tuple(running[n].shape):
+                            raise RuntimeError(
+                                f"soup shape mismatch at {n}: running {tuple(running[n].shape)} "
+                                f"vs cand {tuple(cand[n].shape) if n in cand else None}")
+                trial = None if running is None else {
+                    n: (running[n] * n_accepted + cand[n].to(torch.float32)) / (n_accepted + 1)
+                    for n in running}
                 load_weights(trial)
                 tl = eval_now()
                 if tl < soup_loss - 1e-4:
                     running, soup_loss, n_accepted = trial, tl, n_accepted + 1
             log(f"soup: {n_accepted}/{len(soup_pool)} ckpts -> dev {soup_loss:.5f} "
                 f"(best single {soup_pool[0][0]:.5f})")
-            candidates["soup"] = (soup_loss, {n: t.to(torch.bfloat16) for n, t in running.items()})
+            candidates["soup"] = (soup_loss, None if running is None else
+                                  {n: t.to(torch.bfloat16) for n, t in running.items()})
         except Exception as e:
-            log(f"soup failed ({type(e).__name__}: {e})")
+            import traceback
+            log(f"soup failed ({type(e).__name__}: {e})\n" + traceback.format_exc())
     soup_pool.clear()
 
     if persample_sel and best.get("state") is not None:
@@ -576,7 +727,8 @@ def main() -> None:
         best["loss"] = min(best["loss"], picked_loss)
         export(trainer, f"{picked}-persample")
     else:
-        winner = min(candidates.items(), key=lambda kv: kv[1][0])
+        winner = (min(candidates.items(), key=lambda kv: kv[1][0]) if candidates
+                  else ("best-ondisk", (best["loss"], None)))
         picked, (picked_loss, picked_state) = winner[0], winner[1]
         log(f"final: best_ondisk={best['loss']:.5f} " +
             " ".join(f"{k}={v[0]:.5f}" for k, v in candidates.items()) + f" -> pick {picked}")

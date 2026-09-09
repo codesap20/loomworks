@@ -114,6 +114,20 @@ def choose_regime(params: float | None, n_gpus: int, gpu_free_gib: float) -> dic
     # decision on hardware that would not pick it (the champion runs LoRA on every
     # model >=9B, including the 14B continuous-SFT gate, while our memory rule picks
     # full-ft there; this makes the two comparable on one GPU). Never set in production.
+    # PRODUCTION preference (not a test override): ask for LoRA even when full-ft fits.
+    # Measured on Qwen3-4B chat with the validator's per-sample rule, both arms run to
+    # convergence under the champion's schedule:
+    #   5,950 rows  full-ft 0.34225 | LoRA r64 0.33389   -> LoRA by 0.0094 (290-32)
+    #   39,478 rows full-ft 0.31556 | LoRA r64 0.31172   -> LoRA by 0.0038 (176-41)
+    # The edge shrinks as the data grows, as a regularization effect should, but it does
+    # not invert. On instruct LoRA merely TIES full-ft (0.95219 vs 0.95207 at r128), so
+    # this is applied to chat only. Note the DIST is deliberately left as the memory rule
+    # computed it for full-ft: LoRA needs strictly less memory, so that placement is
+    # always feasible, and it is exactly what was measured (forcing the large-model LoRA
+    # branch would drop a small model onto single-offload and make it slower for nothing).
+    if os.environ.get("SN56_ADAPTER_PREF") == "lora" and regime.get("adapter") is None:
+        regime["adapter"] = {"r": 64, "alpha": 128, "dropout": 0.05}
+
     adapter = os.environ.get("SN56_FORCE_ADAPTER")
     if adapter == "lora":
         regime["adapter"] = {"r": 64, "alpha": 128, "dropout": 0.05}

@@ -154,6 +154,11 @@ def main() -> None:
             if args.task_type == "ChatTask":
                 sft_env["SN56_CHAMP_SCHED"] = os.environ.get("SN56_CHAMP_SCHED", "1")
                 sft_env["SN56_LR_MULT"] = os.environ.get("SN56_LR_MULT", "1.0")
+                # Chat trains better with an adapter than with a full fine-tune at every
+                # data scale we measured (see plan.choose_regime). This matters most on the
+                # continuous-SFT gate: it is a ChatTask on 4xH100 where our memory rule
+                # would otherwise pick full-ft, while the champion runs LoRA there.
+                sft_env["SN56_ADAPTER_PREF"] = os.environ.get("SN56_ADAPTER_PREF", "lora")
             return run([sys.executable, os.path.join(SRC, "train_sft.py"),
                         *common, "--tokenized-dir", tok_dir], end_ts, sft_env)
 

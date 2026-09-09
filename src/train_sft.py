@@ -690,9 +690,13 @@ def main() -> None:
                 eng.optimizer.parameter_offload.get_param_coordinator().release_and_reset_all(eng.module)
             except Exception as e2:
                 log(f"zero3 quiesce failed ({type(e1).__name__}: {e1}; {type(e2).__name__}: {e2})")
+        matched = [0, 0]
         with torch.no_grad():
             for n, p in model.named_parameters():
                 with deepspeed.zero.GatheredParameters([p], modifier_rank=0):
+                    if is_main and state is not None:
+                        matched[1] += 1
+                        matched[0] += 1 if n in state else 0
                     if is_main and state is not None and n in state:
                         src = state[n]
                         if tuple(src.shape) != tuple(p.shape):
@@ -700,6 +704,16 @@ def main() -> None:
                                 f"zero3 load shape mismatch at {n}: param {tuple(p.shape)} "
                                 f"(ds_status={getattr(p, 'ds_status', None)}) vs state {tuple(src.shape)}")
                         p.copy_(src.to(p.device, p.dtype))
+        # A silent no-op here would be invisible: the soup would "succeed" while loading
+        # nothing. PEFT's saved adapter keys and named_parameters() do not use the same
+        # convention (the adapter name is inserted in one and stripped in the other), so
+        # this is a live risk on the LoRA+zero3 path the continuous-SFT gate now takes.
+        if is_main and state is not None and matched[0] == 0 and matched[1] > 0:
+            raise RuntimeError(
+                f"zero3 load matched 0 of {matched[1]} params against a {len(state)}-key state "
+                f"(first state keys: {list(state)[:3]}) — key convention mismatch, not a no-op to ignore")
+        if is_main and state is not None:
+            log(f"zero3 load: matched {matched[0]}/{matched[1]} params")
 
     def load_slot_state(slot_dir):
         """rank 0: read a slot's safetensors into a CPU fp32 dict; others: None."""

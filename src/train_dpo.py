@@ -103,16 +103,19 @@ def main() -> None:
     elif pb < 12:   lr = 5e-6
     elif pb < 15:   lr = 8.5e-6
     else:           lr = 8e-6
-    # Measured on Qwen3-4B (H200, 2026-09-09) with the validator's exact DPO loss:
-    # the champion-matched table alone is too COLD. mean DPO loss by multiplier:
-    #   0.50 -> 0.04834 | 0.75 -> 0.02787 | 1.00 -> 0.01756 (old default)
-    #   1.25 -> 0.01246 | 1.50 -> 0.00856 | 1.75 -> 0.00739  <- minimum, new default
-    #   2.00 -> 0.00935 (more pair wins vs 1.75 but WORSE mean; the rule requires the
-    #                    sample winner not be worse on the ranking loss, so rejected)
-    # 1.75x cuts DPO loss 58% vs the old 1.0x default (0.01756 -> 0.00739).
-    # Note chat wanted COOLER lr (0.85x) while DPO wants HOTTER (1.75x) — the
-    # champion's single size-bucketed table is optimal for neither task.
-    lr *= float(os.environ.get("SN56_DPO_LR_MULT") or 1.75)
+    # LR multiplier over the champion-matched table. Two sweeps on Qwen3-4B with the
+    # validator's exact per-pair DPO loss, and they DISAGREE because one was
+    # undertrained — the converged one wins:
+    #   700s, epoch 0.35:  1.00 -> 0.01756 | 1.50 -> 0.00856 | 1.75 -> 0.00739 (min)
+    #   3300s, epoch 2.98: 1.00 -> 0.00601 (min) | 1.25 -> 0.00678 | 1.50 -> 0.00797
+    #                      | 1.75 -> 0.00649
+    # The validator budgets ~2 epochs (TARGET_TRAINING_EPOCHS), so the second sweep is
+    # the relevant one and the hotter default it replaces was fitted to a regime that
+    # never runs. At convergence the champion's own table entry is the best of the four,
+    # so we keep 1.0. Caveat: 241-244 of 250 pairs TIE at this point, so the spread
+    # between multipliers is small and partly noise — which is another reason to sit on
+    # the table value rather than a hotter one justified by a single undertrained run.
+    lr *= float(os.environ.get("SN56_DPO_LR_MULT") or 1.0)
     if use_lora:
         lr *= 4
 

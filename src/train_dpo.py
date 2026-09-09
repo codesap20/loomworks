@@ -103,7 +103,14 @@ def main() -> None:
     elif pb < 12:   lr = 5e-6
     elif pb < 15:   lr = 8.5e-6
     else:           lr = 8e-6
-    lr *= float(os.environ.get("SN56_DPO_LR_MULT") or 1.0)
+    # Measured on Qwen3-4B (H200, 2026-09-09) with the validator's exact DPO loss:
+    # the champion-matched table alone is too COLD. mean DPO loss by multiplier:
+    #   0.50 -> 0.04834 | 0.75 -> 0.02787 | 1.00 -> 0.01756 (old default)
+    #   1.50 -> 0.00856 (beats 1.00 by 27-2 per-pair)  <- best mean, new default
+    #   2.00 -> 0.00935 (more pair wins but WORSE mean, and the rule requires the
+    #                    sample winner not be worse on the ranking loss)
+    # Halves our DPO loss. Note chat wanted COOLER lr (0.85x) while DPO wants HOTTER.
+    lr *= float(os.environ.get("SN56_DPO_LR_MULT") or 1.5)
     if use_lora:
         lr *= 4
 

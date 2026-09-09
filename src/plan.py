@@ -75,7 +75,7 @@ def sft_lr(params: float | None) -> float:
     return float(min(2e-4, max(4e-6, lr)))
 
 
-def choose_regime(params: float | None, n_gpus: int, gpu_free_gib: float) -> dict:
+def _choose_regime(params: float | None, n_gpus: int, gpu_free_gib: float) -> dict:
     """full-ft vs LoRA and the distribution strategy.
 
     Memory rule of thumb for AdamW full-ft in bf16 with fp32 master+moments:
@@ -96,6 +96,21 @@ def choose_regime(params: float | None, n_gpus: int, gpu_free_gib: float) -> dic
     # can't hold a 30B+ base anyway (validator gives 4-8x here) but keep offload.
     return {"adapter": {"r": 64, "alpha": 128, "dropout": 0.05},
             "dist": "zero3" if n_gpus > 1 else "single-offload"}
+
+
+def choose_regime(params: float | None, n_gpus: int, gpu_free_gib: float) -> dict:
+    """Regime picker, with a test-only override.
+
+    SN56_FORCE_DIST lets validation exercise a distribution strategy the local box
+    would not otherwise pick (e.g. running zero3 at world_size=1 to test the path
+    the validator uses for the 14B continuous-SFT gate and the 71B boss instruct).
+    Never set in production.
+    """
+    regime = _choose_regime(params, n_gpus, gpu_free_gib)
+    forced = os.environ.get("SN56_FORCE_DIST")
+    if forced:
+        regime["dist"] = forced
+    return regime
 
 
 def micro_batch_for(params: float | None, seq_len: int, gpu_free_gib: float,

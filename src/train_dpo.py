@@ -240,9 +240,9 @@ def main() -> None:
     # Gated ON with SN56_DPO_LR_SEARCH=1 until validated.
     if os.environ.get("SN56_DPO_LR_SEARCH") == "1" and args.num_gpus == 1:
         import lr_search
-        probe_steps = int(os.environ.get("SN56_DPO_SEARCH_STEPS") or 20)
+        probe_steps = int(os.environ.get("SN56_DPO_SEARCH_STEPS") or 16)
         n_cand = int(os.environ.get("SN56_DPO_SEARCH_N") or 4)
-        frac = float(os.environ.get("SN56_DPO_SEARCH_FRAC") or 0.15)
+        frac = float(os.environ.get("SN56_DPO_SEARCH_FRAC") or 0.20)
         budget_s = end_ts - time.time() - save_margin
         deadline = time.time() + max(60.0, budget_s * frac)
         cands = lr_search.candidate_lrs(lr, n_cand, 0.3)
@@ -259,21 +259,40 @@ def main() -> None:
         results = {}
         probing["on"] = True
         saved_max_steps, saved_lr = cfg.max_steps, cfg.learning_rate
+
+        def _probe(c: float) -> float:
+            _restore()
+            # a fresh optimizer + scheduler per candidate, or probe N inherits
+            # probe N-1's Adam moments and decayed schedule
+            trainer.optimizer, trainer.lr_scheduler = None, None
+            trainer.args.max_steps = probe_steps
+            trainer.args.learning_rate = c
+            t0 = time.time()
+            trainer.train()
+            dl = trainer.evaluate().get("eval_loss", float("inf"))
+            results[c] = dl
+            log(f"dpo lr-search: lr={c:.2e} held-out dpo_loss={dl:.5f} "
+                f"({time.time() - t0:.0f}s)")
+            return time.time() - t0
+
         try:
+            cost = 0.0
             for c in cands:
-                if time.time() > deadline:
+                # stop before starting a probe we cannot finish, not after overrunning
+                if time.time() + cost > deadline:
                     log("dpo lr-search: out of budget; using what was measured")
                     break
-                _restore()
-                # a fresh optimizer + scheduler per candidate, or probe N inherits
-                # probe N-1's Adam moments and decayed schedule
-                trainer.optimizer, trainer.lr_scheduler = None, None
-                trainer.args.max_steps = probe_steps
-                trainer.args.learning_rate = c
-                trainer.train()
-                dl = trainer.evaluate().get("eval_loss", float("inf"))
-                results[c] = dl
-                log(f"dpo lr-search: lr={c:.2e} held-out dpo_loss={dl:.5f}")
+                cost = max(cost, _probe(c))
+            # A fixed window only finds the optimum if the seed is already inside it.
+            # Our seed is a size-bucket table entry, so when the best probe sits at the
+            # hot or cold END of the window the optimum is usually past it — step
+            # outward while it keeps winning. (The champion does the same.)
+            step_dec = 0.6 / max(1, n_cand - 1)
+            for _ in range(4):
+                nxt = lr_search.edge_extension(results, step_dec, 4)
+                if nxt is None or time.time() + cost > deadline:
+                    break
+                cost = max(cost, _probe(nxt))
         except Exception as e:
             log(f"dpo lr-search failed ({type(e).__name__}: {e}); keeping {lr:.2e}")
         finally:

@@ -45,6 +45,30 @@ def candidate_lrs(center: float, n: int, half_range_decades: float) -> list[floa
     return [10 ** (lo + i * (hi - lo) / (n - 1)) for i in range(n)]
 
 
+def edge_extension(results: dict, step_decades: float, max_extensions: int) -> float | None:
+    """Next LR to try when the best result sits at an END of the tested range.
+
+    A fixed window only finds the optimum if the seed LR is already within it. When
+    the best score is at the hottest (or coldest) candidate the true optimum is
+    usually outside, so step further in that direction while it keeps improving.
+    Returns None when the best is interior, or when the extension budget is spent.
+    """
+    finite = {k: v for k, v in results.items() if math.isfinite(v)}
+    if len(finite) < 2:
+        return None
+    ordered = sorted(finite)
+    best = min(finite, key=finite.get)
+    span = math.log10(max(ordered)) - math.log10(min(ordered))
+    # every extension widens the span by step_decades; stop after max_extensions
+    if span >= (len(ordered) - 1) * step_decades + max_extensions * step_decades:
+        return None
+    if best == ordered[-1]:
+        return 10 ** (math.log10(best) + step_decades)
+    if best == ordered[0]:
+        return 10 ** (math.log10(best) - step_decades)
+    return None
+
+
 @torch.no_grad()
 def _snapshot(model) -> dict:
     return {n: p.detach().to("cpu", copy=True)
@@ -131,6 +155,7 @@ def _train_candidate(model, batches, lr, steps, accum, opt_factory, log) -> bool
 def search(model, train_batches: list, dev_batches: list, center_lr: float, *,
            steps: int, accum: int, opt_factory, deadline: float,
            n_candidates: int = 4, half_range_decades: float = 0.3,
+           max_extensions: int = 3,
            edge_tolerance: float = _EDGE_TOLERANCE, log=print) -> tuple[float, dict]:
     """Return (chosen_lr, info). Restores the model's initial weights before
     returning, so the caller's real run starts from an untouched model."""
@@ -152,6 +177,18 @@ def search(model, train_batches: list, dev_batches: list, center_lr: float, *,
             dl = _dev_loss(model, dev_batches)
             results[lr] = dl
             log(f"lr-search: lr={lr:.2e} dev={dl:.5f}")
+        # the optimum is often outside a fixed window; ride the winning edge outward
+        for _ in range(max_extensions):
+            nxt = edge_extension(results, half_range_decades * 2 / max(1, n_candidates - 1),
+                                 max_extensions)
+            if nxt is None or time.time() > deadline:
+                break
+            _restore(model, snap)
+            if not _train_candidate(model, train_batches, nxt, steps, accum, opt_factory, log):
+                results[nxt] = float("inf")
+                break
+            results[nxt] = _dev_loss(model, dev_batches)
+            log(f"lr-search: edge extension lr={nxt:.2e} dev={results[nxt]:.5f}")
     finally:
         _restore(model, snap)
         del snap

@@ -240,7 +240,14 @@ def main() -> None:
     # quantity the validator computes — and the pick is a plain argmin with no
     # bias toward hotter LRs. Our fixed multiplier was tuned on ONE synthetic
     # dataset at epoch 0.35; a search transfers to datasets we have never seen.
-    # Gated ON with SN56_DPO_LR_SEARCH=1 until validated.
+    # MEASURED 2026-09-09 AND REFUTED — leave OFF. The mechanics work (4 candidates +
+    # an edge extension inside budget) and probes are scored on held-out DPO loss with
+    # no hot-LR bias, but a 16-step probe cannot rank LRs for a 480-step run: it picked
+    # 1.38e-4, whose probe loss was the best by far, and that arm then scored 0.01255 on
+    # the held-out set versus 0.00601 for the plain table value — the worst of five arms,
+    # despite having the BEST dev loss. Short probes favour whatever moves the margin
+    # fastest early, which is the same bias that made every 700s sweep wrong.
+    # Kept as gated, budget-safe code; do not enable without much deeper probes.
     if os.environ.get("SN56_DPO_LR_SEARCH") == "1" and args.num_gpus == 1:
         import lr_search
         probe_steps = int(os.environ.get("SN56_DPO_SEARCH_STEPS") or 16)

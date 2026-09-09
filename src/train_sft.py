@@ -83,6 +83,10 @@ class WsdPlan:
         return 1.0
 
 
+class _SoupDone(Exception):
+    """Internal: the uniform soup path finished; skip the greedy loop below."""
+
+
 def main() -> None:
     args = parse_args()
     maybe_reexec_distributed(args)
@@ -419,6 +423,10 @@ def main() -> None:
     soup_enabled = (os.environ.get("SN56_USE_SOUP") == "1"
                     and regime["dist"] in ("single", "single-offload", "ddp", "zero3"))
     soup_k = int(os.environ.get("SN56_SOUP_K") or 4)
+    # greedy = test each candidate against dev and keep it if dev improves (k selection
+    # passes); uniform = average the pool once and read dev once (1 pass). See the soup
+    # block for the measurement that motivates having the choice.
+    soup_mode = os.environ.get("SN56_SOUP_MODE", "greedy")
     # evals per run and the early-stop patience move together: at 2x the eval
     # density, 3 stale evals is half as much training as before, so scale it.
     evals_per_run = int(os.environ.get("SN56_EVALS_PER_RUN") or 12)
@@ -753,6 +761,28 @@ def main() -> None:
             def _f32(d):
                 return None if d is None else {n: t.to(torch.float32).clone() for n, t in d.items()}
             running = _f32(soup_pool[0][1])
+            if soup_mode == "uniform":
+                # Uniform soup (Wortsman 2022's other variant): average the whole pool
+                # in one shot and read the dev loss ONCE. The greedy variant instead
+                # tests every candidate against dev and keeps it if dev improves, which
+                # is k extra selection passes over a ~250-490 row split. Measured
+                # 2026-09-09: feeding greedy more candidates (24/36 evals, k 6/8) drove
+                # dev 0.019 BETTER while the held-out score got 0.0027 WORSE — the greedy
+                # acceptance is fitting dev noise. Uniform has one selection pass total.
+                for _, cand in soup_pool[1:]:
+                    if running is not None:
+                        for n in running:
+                            running[n] += cand[n].to(torch.float32)
+                if running is not None:
+                    for n in running:
+                        running[n] /= len(soup_pool)
+                load_weights(running)
+                soup_loss = eval_now()
+                log(f"soup(uniform): {len(soup_pool)} ckpts -> dev {soup_loss:.5f} "
+                    f"(best single {soup_pool[0][0]:.5f})")
+                candidates["soup"] = (soup_loss, None if running is None else
+                                      {n: t.to(torch.bfloat16) for n, t in running.items()})
+                raise _SoupDone
             load_weights(running)
             soup_loss = eval_now()
             n_accepted = 1
@@ -774,6 +804,8 @@ def main() -> None:
                 f"(best single {soup_pool[0][0]:.5f})")
             candidates["soup"] = (soup_loss, None if running is None else
                                   {n: t.to(torch.bfloat16) for n, t in running.items()})
+        except _SoupDone:
+            pass
         except Exception as e:
             import traceback
             log(f"soup failed ({type(e).__name__}: {e})\n" + traceback.format_exc())

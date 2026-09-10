@@ -159,7 +159,8 @@ def main() -> None:
     except Exception:
         pass
     micro = state.get("dpo", {}).get("batch_size") or max(
-        1, min(8, plan_mod.micro_batch_for(params, max_len, free_gib, not use_lora) // 3))
+        1, min(8, plan_mod.micro_batch_for(params, max_len, free_gib, not use_lora,
+                                           vocab=info.get("vocab")) // 3))
     accum = max(1, round(32 / (micro * max(1, args.num_gpus))))
 
     end_ts = args.end_ts

@@ -202,7 +202,8 @@ def main() -> None:
     # ---- batch / step planning -------------------------------------------- #
     seq_len = meta.get("seq_len", 4096)
     micro_bs = sft_state.get("micro_batch") or plan_mod.micro_batch_for(
-        info["params"], min(seq_len, meta.get("len_p95", seq_len)), free_gib, lora is None)
+        info["params"], min(seq_len, meta.get("len_p95", seq_len)), free_gib, lora is None,
+        vocab=info.get("vocab"))
     if packing:
         micro_bs = max(1, micro_bs // 2)  # flattened rows are mb x len long
     world = max(1, args.num_gpus)

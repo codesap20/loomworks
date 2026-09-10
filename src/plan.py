@@ -142,11 +142,23 @@ def choose_regime(params: float | None, n_gpus: int, gpu_free_gib: float) -> dic
 
 
 def micro_batch_for(params: float | None, seq_len: int, gpu_free_gib: float,
-                    full_ft: bool) -> int:
-    """Crude activation-based micro-batch guess; the OOM ladder corrects it."""
+                    full_ft: bool, vocab: int | None = None) -> int:
+    """Activation-based micro-batch guess; the OOM ladder corrects what is left.
+
+    The output logits, not the hidden activations, dominate at modern vocab sizes and
+    were missing from this estimate entirely. For Qwen3 (vocab 151936) at seq_len 4096
+    one sample's logits are ~4.6 GiB — bf16 from the forward, an fp32 copy for the
+    cross-entropy, and a gradient — against ~0.5 GiB of hidden activations for a 4B
+    model. Ignoring that put the first guess 3-5x too high: a real in-image run asked
+    for a 72.5 GiB allocation and burned two of its five attempts before the ladder
+    halved into a batch that fit.
+    """
     p = params or 7e9
     weight_overhead = (p * (16 if full_ft else 2.5)) / 2**30
-    per_sample_gib = max(0.05, (p / 7e9) * (seq_len / 4096) * 0.9)
+    hidden_gib = max(0.05, (p / 7e9) * (seq_len / 4096) * 0.9)
+    # bf16 logits + fp32 upcast for the loss + gradient, at ~8 bytes per logit
+    logits_gib = seq_len * (vocab or 32_000) * 8 / 2**30
+    per_sample_gib = hidden_gib + logits_gib
     room = max(gpu_free_gib - weight_overhead - 6, per_sample_gib)
     mb = int(room / per_sample_gib)
     return max(1, min(mb, 64))

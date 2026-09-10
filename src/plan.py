@@ -142,7 +142,8 @@ def choose_regime(params: float | None, n_gpus: int, gpu_free_gib: float) -> dic
 
 
 def micro_batch_for(params: float | None, seq_len: int, gpu_free_gib: float,
-                    full_ft: bool, vocab: int | None = None) -> int:
+                    full_ft: bool, vocab: int | None = None,
+                    fused_ce: bool = False) -> int:
     """Activation-based micro-batch guess; the OOM ladder corrects what is left.
 
     The output logits, not the hidden activations, dominate at modern vocab sizes and
@@ -156,10 +157,14 @@ def micro_batch_for(params: float | None, seq_len: int, gpu_free_gib: float,
     p = params or 7e9
     weight_overhead = (p * (16 if full_ft else 2.5)) / 2**30
     hidden_gib = max(0.05, (p / 7e9) * (seq_len / 4096) * 0.9)
-    # bf16 logits + fp32 upcast for the loss + their gradients: ~10 bytes per logit.
-    # Measured against a real failure: micro_batch 43 x 4008 tokens x 151936 vocab in
-    # fp32 is 99.8 GiB, exactly the allocation the container asked for before halving.
-    logits_gib = seq_len * (vocab or 32_000) * 10 / 2**30
+    # Per-logit peak bytes. Without a fused loss the full logits tensor is materialized
+    # in bf16, upcast to fp32 for the cross-entropy, and both carry gradients — measured
+    # at ~20 bytes/logit against a real failure (43 rows x 4008 tokens x 151936 vocab in
+    # fp32 is 99.8 GiB, exactly the allocation the container asked for). Liger's fused
+    # linear cross-entropy never materializes them, chunking the lm_head instead, which
+    # is why it is worth enabling: it is the difference between a micro-batch of 10 and
+    # one of ~30 on an 80 GB card.
+    logits_gib = seq_len * (vocab or 32_000) * (5 if fused_ce else 20) / 2**30
     per_sample_gib = hidden_gib + logits_gib
     room = max(gpu_free_gib - weight_overhead - 6, per_sample_gib)
     mb = int(room / per_sample_gib)

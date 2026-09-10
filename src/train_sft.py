@@ -204,9 +204,17 @@ def main() -> None:
     # Size on the LONGEST row, not p95: group_by_length is on, so one batch ends up
     # entirely max-length. Sizing on p95 is what produced the 99.8 GiB allocation the
     # OOM ladder then had to halve twice.
+    # Liger's fused linear cross-entropy would avoid materializing the logits tensor —
+    # this workload's memory ceiling at a 151936-token vocab — and the champion enables
+    # it (their instruct_config passes use_liger). MEASURED AND REJECTED for us: the same
+    # chat recipe scored 0.99504 with it against 0.98579 without, losing to the champion's
+    # own recipe (115-167) where the unfused runs beat it, and it still OOMed once at the
+    # larger batch it allows. A 0.009 regression is far more than the batch headroom is
+    # worth. Opt in with SN56_LIGER=1 only after re-measuring.
+    use_liger = os.environ.get("SN56_LIGER", "0") == "1"
     micro_bs = sft_state.get("micro_batch") or plan_mod.micro_batch_for(
         info["params"], min(seq_len, meta.get("len_max", seq_len)), free_gib, lora is None,
-        vocab=info.get("vocab"))
+        vocab=info.get("vocab"), fused_ce=use_liger)
     if packing:
         micro_bs = max(1, micro_bs // 2)  # flattened rows are mb x len long
     world = max(1, args.num_gpus)
@@ -592,6 +600,7 @@ def main() -> None:
         length_column_name="length",
         neftune_noise_alpha=(float(os.environ["SN56_NEFTUNE"]) if os.environ.get("SN56_NEFTUNE")
                              else (1.0 if len(train_ds) < 20_000 else None)),
+        use_liger_kernel=use_liger,
         deepspeed=ds_cfg,
         report_to=[],
         seed=1337,
@@ -647,15 +656,27 @@ def main() -> None:
                     out.metrics["eval_n"] = int(ps.size)
             return out
 
-    trainer = SftTrainer(
-        model=model,
-        args=targs,
-        train_dataset=train_ds,
-        eval_dataset=dev_ds,
-        data_collator=train_collator,
-        processing_class=tokenizer,
-        callbacks=[ClockCallback(), EmaCallback()],
-    )
+    def _build_trainer():
+        return SftTrainer(
+            model=model,
+            args=targs,
+            train_dataset=train_ds,
+            eval_dataset=dev_ds,
+            data_collator=train_collator,
+            processing_class=tokenizer,
+            callbacks=[ClockCallback(), EmaCallback()],
+        )
+
+    try:
+        trainer = _build_trainer()
+    except Exception as e:
+        # Liger patches the model at Trainer construction and only knows certain
+        # architectures. An unsupported one must cost us a warning, not the task.
+        if not targs.use_liger_kernel:
+            raise
+        log(f"liger kernel unavailable for this model ({type(e).__name__}: {e}); continuing without")
+        targs.use_liger_kernel = False
+        trainer = _build_trainer()
 
     try:
         trainer.train()

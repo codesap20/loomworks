@@ -201,8 +201,11 @@ def main() -> None:
 
     # ---- batch / step planning -------------------------------------------- #
     seq_len = meta.get("seq_len", 4096)
+    # Size on the LONGEST row, not p95: group_by_length is on, so one batch ends up
+    # entirely max-length. Sizing on p95 is what produced the 99.8 GiB allocation the
+    # OOM ladder then had to halve twice.
     micro_bs = sft_state.get("micro_batch") or plan_mod.micro_batch_for(
-        info["params"], min(seq_len, meta.get("len_p95", seq_len)), free_gib, lora is None,
+        info["params"], min(seq_len, meta.get("len_max", seq_len)), free_gib, lora is None,
         vocab=info.get("vocab"))
     if packing:
         micro_bs = max(1, micro_bs // 2)  # flattened rows are mb x len long

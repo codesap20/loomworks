@@ -156,8 +156,10 @@ def micro_batch_for(params: float | None, seq_len: int, gpu_free_gib: float,
     p = params or 7e9
     weight_overhead = (p * (16 if full_ft else 2.5)) / 2**30
     hidden_gib = max(0.05, (p / 7e9) * (seq_len / 4096) * 0.9)
-    # bf16 logits + fp32 upcast for the loss + gradient, at ~8 bytes per logit
-    logits_gib = seq_len * (vocab or 32_000) * 8 / 2**30
+    # bf16 logits + fp32 upcast for the loss + their gradients: ~10 bytes per logit.
+    # Measured against a real failure: micro_batch 43 x 4008 tokens x 151936 vocab in
+    # fp32 is 99.8 GiB, exactly the allocation the container asked for before halving.
+    logits_gib = seq_len * (vocab or 32_000) * 10 / 2**30
     per_sample_gib = hidden_gib + logits_gib
     room = max(gpu_free_gib - weight_overhead - 6, per_sample_gib)
     mb = int(room / per_sample_gib)

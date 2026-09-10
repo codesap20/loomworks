@@ -615,7 +615,14 @@ def main() -> None:
     # the validator ranks lower. SN56_DEV_METRIC=persample makes every dev reading
     # (best-ckpt, early-stop, soup acceptance, final pick) the validator's mean,
     # computed inside the normal eval pass (no extra forward). Default unchanged.
-    dev_metric = os.environ.get("SN56_DEV_METRIC", "tokw")
+    # Default persample as of 2026-09-10. Every dev decision — best-checkpoint tracking,
+    # the overfitting early-stop, greedy soup acceptance and the final raw/ema/soup pick —
+    # reads eval_loss, and the validator scores the mean over EXAMPLES of each example's
+    # mean completion CE, not a token-weighted mean. Measured on 4B chat LoRA against the
+    # exact boss rule: mean gap 0.00777 (bound 0.00671) vs 0.00694 (0.00583) on the
+    # token-weighted metric, and the per-example win rate rose 86.1% -> 89.0%. Decided by
+    # 54-15 of the samples that separate the two arms, so directional rather than noise.
+    dev_metric = os.environ.get("SN56_DEV_METRIC", "persample")
 
     # OBJECTIVE ALIGNMENT. The validator scores the MEAN OVER EXAMPLES of each example's
     # mean completion CE, so every held-out row counts once regardless of length. The
@@ -625,6 +632,11 @@ def main() -> None:
     # the mean gap over ALL examples needs to roughly double while our win rate on decided
     # examples is already 86%. This makes the training loss per-example-mean to match.
     # SN56_LOSS=persample; off until measured.
+    # REFUTED for the training loss (measured 2026-09-10): per-example weighting scored
+    # 0.00666 against 0.00694 for token-weighting, i.e. neutral-to-worse. Token-weighting
+    # is the better LEARNING signal — a long row carries more supervised tokens and so more
+    # gradient — and you do not have to mirror the evaluation weighting to do well on it.
+    # Aligning the SELECTION metric (dev_metric below) DID pay; aligning the loss did not.
     loss_mode = os.environ.get("SN56_LOSS", "tokw")
 
     class SftTrainer(trainer_cls):

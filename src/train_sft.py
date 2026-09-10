@@ -617,7 +617,38 @@ def main() -> None:
     # computed inside the normal eval pass (no extra forward). Default unchanged.
     dev_metric = os.environ.get("SN56_DEV_METRIC", "tokw")
 
+    # OBJECTIVE ALIGNMENT. The validator scores the MEAN OVER EXAMPLES of each example's
+    # mean completion CE, so every held-out row counts once regardless of length. The
+    # default training loss is token-weighted (sum of token CE / total tokens), which
+    # weights a 3000-token row 30x a 100-token one. Those are different objectives, and
+    # the audit showed our binding constraint is exactly the quantity we are NOT training:
+    # the mean gap over ALL examples needs to roughly double while our win rate on decided
+    # examples is already 86%. This makes the training loss per-example-mean to match.
+    # SN56_LOSS=persample; off until measured.
+    loss_mode = os.environ.get("SN56_LOSS", "tokw")
+
     class SftTrainer(trainer_cls):
+        def compute_loss(self, model, inputs, return_outputs=False, **kw):
+            # KL-weighted tasks keep KlTrainer's objective: the validator adds its own KL
+            # penalty there and the challenger must not be worse once it is applied, so
+            # re-weighting the CE half alone would optimise something it does not score.
+            if loss_mode != "persample" or kl_coef > 0.0 or "labels" not in inputs:
+                return super().compute_loss(model, inputs, return_outputs=return_outputs, **kw)
+            labels = inputs["labels"]
+            outputs = model(**{k: v for k, v in inputs.items() if k != "labels"})
+            sl = outputs.logits[:, :-1, :].float()
+            slab = labels[:, 1:]
+            ce = F.cross_entropy(sl.reshape(-1, sl.size(-1)), slab.reshape(-1),
+                                 ignore_index=-100, reduction="none").view(slab.shape)
+            n_sup = (slab != -100).sum(1)
+            keep = n_sup > 0
+            if not bool(keep.any()):
+                loss = sl.sum() * 0.0            # keep the graph, contribute nothing
+            else:
+                per_sample = ce.sum(1)[keep] / n_sup[keep]
+                loss = per_sample.mean()
+            return (loss, outputs) if return_outputs else loss
+
         def get_eval_dataloader(self, eval_dataset=None):
             # eval must not be packed: loss weighting would differ from the validator
             self.data_collator, keep = pad_collator, self.data_collator
@@ -805,6 +836,22 @@ def main() -> None:
     if ema_enabled and ema and have_budget:
         load_weights(ema)
         candidates["ema"] = (eval_now(), {n: t.clone() for n, t in ema.items()})
+
+    # The EMA is a different point in weight space from any single checkpoint — it
+    # averages along the trajectory rather than across it — and on chat it has been
+    # winning the final pick outright while the soup wins on LoRA. Offering it to the
+    # greedy soup lets the two combine instead of competing. Added ALONGSIDE the pool
+    # (not into its top-k) so it never evicts a checkpoint. Off until measured.
+    if (os.environ.get("SN56_SOUP_EMA") == "1" and soup_enabled and ema_enabled
+            and "ema" in candidates and soup_pool and not soup_disk):
+        ema_bf16 = {n: t.to(torch.bfloat16) for n, t in ema.items()}
+        if all(n in soup_pool[0][1] for n in ema_bf16):
+            soup_pool.append((candidates["ema"][0], ema_bf16))
+            soup_pool.sort(key=lambda x: x[0])
+            log(f"soup: EMA added to the pool at dev {candidates['ema'][0]:.5f} "
+                f"({len(soup_pool)} candidates)")
+        else:
+            log("soup: EMA key set does not match the pool; not adding")
 
     if soup_disk and len(soup_slots) >= 2 and have_budget:
         # materialise the disk slots as the pool (rank 0 holds tensors, others None;

@@ -94,6 +94,8 @@ def main() -> None:
               "--num-gpus", str(n_gpus),
               "--state-file", paths.STATE_FILE]
 
+    repair = {"report": None}  # augment_repair outcome, decided once per task
+
     def attempts() -> bool:
         # keep enough tail for a save: 15 min on long tasks, proportionally less on short ones
         retry_guard = min(900, max(120, (end_ts - start) * 0.15))
@@ -133,6 +135,24 @@ def main() -> None:
                           "--out-dir", tok_dir], end_ts)
                 if rc != 0:
                     return rc
+            # Undo the validator's weight-scaling augmentation (augment_repair.py) — only where the
+            # score is absolute CE: a KL task measures distance from the damaged copy.
+            if (os.environ.get("SN56_AUG_REPAIR", "0") == "1" and os.environ.get("USE_KL") != "1"
+                    and repair["report"] is None):
+                rep_path = os.path.join(paths.WORK_ROOT, "augment_report.json")
+                run([sys.executable, os.path.join(SRC, "augment_repair.py"), "repair",
+                     "--model-path", model_path, "--work-root", paths.WORK_ROOT,
+                     "--tok-dir", tok_dir, "--report", rep_path], end_ts)
+                try:
+                    with open(rep_path) as f:
+                        repair["report"] = json.load(f)
+                except Exception:
+                    repair["report"] = {"scaled": False}
+                if repair["report"].get("scaled"):
+                    common[common.index("--model-path") + 1] = repair["report"]["path"]
+                    # leave time to merge an adapter onto the repaired base afterwards
+                    i = common.index("--end-ts") + 1
+                    common[i] = str(float(common[i]) - 300)
             # ChatTask keeps the champion's cosine schedule and instruct keeps our WSD,
             # but both are now known to be a wash at the real budget (see below) — the
             # split is kept only because each was measured in its own regime.
@@ -178,6 +198,12 @@ def main() -> None:
         return 2
 
     ok = attempts()
+    rep = repair["report"] or {}
+    if ok and rep.get("scaled") and os.path.isfile(os.path.join(out_dir, "adapter_config.json")):
+        # an adapter would be loaded onto the damaged base by the validator; ship merged weights
+        if run([sys.executable, os.path.join(SRC, "augment_repair.py"), "merge",
+                "--base", rep["path"], "--out-dir", out_dir], end_ts + 150) != 0:
+            print("[main] merge onto the repaired base failed; the adapter submission stands", flush=True)
     if not ok:
         try:
             emergency_submission(model_path, out_dir, plan_mod.needs_modern_stack(info))

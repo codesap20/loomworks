@@ -239,3 +239,50 @@ def maybe_repair(model_path: str, work_root: str, tok_dir: str, log=print) -> tu
     except Exception as e:
         log(f"[augment] repair skipped ({type(e).__name__}: {e}); training from the original")
     return model_path, report
+
+
+def merge_adapter_into(base_dir: str, out_dir: str, log=print) -> bool:
+    """Replace a LoRA submission with full weights merged onto base_dir (the repaired copy).
+
+    The validator loads an adapter onto the task's DAMAGED base, which would silently drop the repair.
+    """
+    import glob
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM
+    dev = "cuda:0" if torch.cuda.is_available() else "cpu"
+    base = AutoModelForCausalLM.from_pretrained(base_dir, torch_dtype=torch.bfloat16, device_map=dev)
+    merged = PeftModel.from_pretrained(base, out_dir).merge_and_unload()
+    tmp = out_dir.rstrip("/") + ".merged"
+    shutil.rmtree(tmp, ignore_errors=True)
+    merged.save_pretrained(tmp, safe_serialization=True)
+    # full weights in first, adapter files out last: if the container is stopped in between, the
+    # adapter still loads (onto the damaged base, i.e. no worse than not repairing)
+    for fn in glob.glob(os.path.join(tmp, "*")):
+        shutil.move(fn, os.path.join(out_dir, os.path.basename(fn)))
+    for fn in os.listdir(out_dir):
+        if fn.startswith("adapter_"):
+            os.remove(os.path.join(out_dir, fn))
+    shutil.rmtree(tmp, ignore_errors=True)
+    log(f"[augment] merged adapter onto the repaired base -> full weights in {out_dir}")
+    return True
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("mode", choices=["repair", "merge"])
+    ap.add_argument("--model-path")
+    ap.add_argument("--work-root")
+    ap.add_argument("--tok-dir")
+    ap.add_argument("--report")
+    ap.add_argument("--base")
+    ap.add_argument("--out-dir")
+    a = ap.parse_args()
+    pr = lambda m: print(m, flush=True)
+    if a.mode == "repair":
+        path, rep = maybe_repair(a.model_path, a.work_root, a.tok_dir, log=pr)
+        rep["path"] = path
+        with open(a.report, "w") as f:
+            json.dump(rep, f)
+    else:
+        merge_adapter_into(a.base, a.out_dir, log=pr)

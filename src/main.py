@@ -140,8 +140,9 @@ def main() -> None:
             # Measured 2026-09-15 (Qwen3-0.6B chat, validator per-sample CE, after full training): scaled
             # x0.6 LoRA 1.405 -> repaired 1.3065, x1.4 LoRA 1.331 -> 1.3066, x0.6 full-ft 1.423 -> 1.312,
             # clean 1.306; repaired beats unrepaired on 635-760 of 773 samples. Clean models are left alone.
+            # (the validator never augments bases >= 35B, so skip reading their weights)
             if (os.environ.get("SN56_AUG_REPAIR", "1") == "1" and os.environ.get("USE_KL") != "1"
-                    and repair["report"] is None):
+                    and (info["params"] or 0) <= 30e9 and repair["report"] is None):
                 rep_path = os.path.join(paths.WORK_ROOT, "augment_report.json")
                 run([sys.executable, os.path.join(SRC, "augment_repair.py"), "repair",
                      "--model-path", model_path, "--work-root", paths.WORK_ROOT,

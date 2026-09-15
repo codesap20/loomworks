@@ -250,7 +250,7 @@ def main() -> None:
             m.eval()
             rank, world = self._shard()
             items = dev[rank::world]
-            gen = torch.Generator(device=m.device).manual_seed(1234 + rank)
+            gen = torch.Generator().manual_seed(1234 + rank)  # CPU: only draws per-batch seeds
             r_sum, r_n, kl_sum = 0.0, 0, 0.0
             bs = 8
             pad_side = tokenizer.padding_side

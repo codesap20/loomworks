@@ -125,9 +125,16 @@ def main() -> None:
             except Exception as e:
                 log(f"distill: reward function skipped ({type(e).__name__}: {e})")
 
-        def save_distilled(m, tag):
+        def save_distilled(src_dir, adapter_name, tag):
+            import shutil
+            # PEFT writes a non-default adapter into <dir>/<adapter_name>/
+            src = os.path.join(src_dir, adapter_name)
+            if not os.path.isfile(os.path.join(src, "adapter_config.json")):
+                src = src_dir
             os.makedirs(args.output_dir, exist_ok=True)
-            m.save_pretrained(args.output_dir)
+            for fn in os.listdir(src):
+                if os.path.isfile(os.path.join(src, fn)):
+                    shutil.copy2(os.path.join(src, fn), os.path.join(args.output_dir, fn))
             tokenizer.save_pretrained(args.output_dir)
             paths.patch_adapter_base(args.output_dir, args.base_model_id)
             log(f"exported {tag}")
@@ -136,7 +143,8 @@ def main() -> None:
         result = None
         try:
             result = grpo_distill.run(model, tokenizer, [d["prompt"] for d in data], [d["prompt"] for d in dev],
-                                      fns, weights, sources, args.end_ts, save_distilled, log, False)
+                                      fns, weights, sources, args.end_ts, save_distilled, log,
+                                      os.path.join(paths.WORK_ROOT, "distill", args.task_id))
         except Exception as e:
             log(f"distill failed ({type(e).__name__}: {e}); falling back to GRPO")
         if result is not None:

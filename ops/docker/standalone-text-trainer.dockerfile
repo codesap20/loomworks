@@ -12,7 +12,8 @@ RUN pip install -U pip packaging==23.2 setuptools==75.8.0 wheel ninja uv && \
     uv pip install --system \
         transformers==4.51.3 trl==0.18.0 peft==0.15.1 accelerate==1.6.0 \
         deepspeed==0.15.4 bitsandbytes==0.45.4 datasets==3.5.0 \
-        liger-kernel==0.5.9 sentencepiece tiktoken==0.9.0 tenacity==9.1.2 && \
+        liger-kernel==0.5.9 sentencepiece tiktoken==0.9.0 tenacity==9.1.2 \
+        textstat==0.7.8 && \
     (pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.4cxx11abiFALSE-cp311-cp311-linux_x86_64.whl \
      || pip install flash-attn==2.7.4.post1 --no-build-isolation) && \
     uv pip install --system vllm==0.8.3 && \

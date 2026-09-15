@@ -233,7 +233,37 @@ def main() -> None:
         remove_unused_columns=False,
     )
 
-    trainer = DPOTrainer(
+    class EvalAlignedDPOTrainer(DPOTrainer):
+        """Train on exactly the token sequences the validator scores (evaluators/dpo.py
+        _tokenize_dpo_pair): prompt tokenized WITH special tokens, eos string appended to the
+        completion, completion = tok(prompt + completion)[len(tok(prompt)):]. TRL 0.18 tokenizes the
+        three fields separately without special tokens, so wherever the tokenizer merges across the
+        prompt/completion boundary (a third of chosen completions on an orca-style set with the
+        Qwen2.5 tokenizer) or adds a BOS (Llama/Mistral/Gemma), we trained on different ids than the
+        ones the paired per-example test compares. The champion has the same mismatch."""
+
+        @staticmethod
+        def tokenize_row(features, processing_class, max_prompt_length, max_completion_length,
+                         add_special_tokens):
+            tok = processing_class
+            prompt, chosen, rejected = features["prompt"], features["chosen"], features["rejected"]
+            eos = tok.eos_token
+            if eos is not None:
+                chosen = chosen if chosen.endswith(eos) else chosen + eos
+                rejected = rejected if rejected.endswith(eos) else rejected + eos
+            p_ids = tok(text=prompt)["input_ids"]
+            c_ids = tok(text=prompt + chosen)["input_ids"][len(p_ids):]
+            r_ids = tok(text=prompt + rejected)["input_ids"][len(p_ids):]
+            if not c_ids or not r_ids:
+                return DPOTrainer.tokenize_row(features, processing_class, max_prompt_length,
+                                               max_completion_length, add_special_tokens)
+            if max_prompt_length is not None:
+                p_ids = p_ids[-max_prompt_length:]
+            if max_completion_length is not None:
+                c_ids, r_ids = c_ids[:max_completion_length], r_ids[:max_completion_length]
+            return {"prompt_input_ids": p_ids, "chosen_input_ids": c_ids, "rejected_input_ids": r_ids}
+
+    trainer = EvalAlignedDPOTrainer(
         model=model,
         ref_model=ref_model,
         args=cfg,

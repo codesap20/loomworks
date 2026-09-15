@@ -189,10 +189,18 @@ def main() -> None:
                         "--dataset-type", args.dataset_type], end_ts)
 
         if args.task_type in ("GrpoTask", "EnvTask"):
+            # GRPO tasks default to oracle distillation (grpo_distill.py). Measured 2026-09-15 on the
+            # alpaca template task, Qwen2.5-1.5B-Instruct, 1000 test prompts, validator-exact 1-v-1:
+            # distill 0.752 vs GRPO(pinned trainer, 1.5 h on H200) 0.125 and vs GRPO(this branch)
+            # 0.177 — 1.5 h of GRPO barely moves the template rewards (unique ratio -0.837 -> -0.834),
+            # distill moves them to -0.127 with the format regex at 0.59. It hands back to GRPO when
+            # it cannot beat the base on dev, and never runs on tasks whose rewards read extra_data.
+            grpo_env = {"SN56_GRPO_MODE": os.environ.get("SN56_GRPO_MODE",
+                                                         "distill" if args.task_type == "GrpoTask" else "grpo")}
             return run([sys.executable, os.path.join(SRC, "train_grpo.py"),
                         *common,
                         "--data-path", data_path,
-                        "--dataset-type", args.dataset_type], end_ts)
+                        "--dataset-type", args.dataset_type], end_ts, grpo_env)
 
         print(f"[main] unknown task type {args.task_type}", flush=True)
         return 2

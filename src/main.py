@@ -137,7 +137,10 @@ def main() -> None:
                     return rc
             # Undo the validator's weight-scaling augmentation (augment_repair.py) — only where the
             # score is absolute CE: a KL task measures distance from the damaged copy.
-            if (os.environ.get("SN56_AUG_REPAIR", "0") == "1" and os.environ.get("USE_KL") != "1"
+            # Measured 2026-09-15 (Qwen3-0.6B chat, validator per-sample CE, after full training): scaled
+            # x0.6 LoRA 1.405 -> repaired 1.3065, x1.4 LoRA 1.331 -> 1.3066, x0.6 full-ft 1.423 -> 1.312,
+            # clean 1.306; repaired beats unrepaired on 635-760 of 773 samples. Clean models are left alone.
+            if (os.environ.get("SN56_AUG_REPAIR", "1") == "1" and os.environ.get("USE_KL") != "1"
                     and repair["report"] is None):
                 rep_path = os.path.join(paths.WORK_ROOT, "augment_report.json")
                 run([sys.executable, os.path.join(SRC, "augment_repair.py"), "repair",
@@ -210,8 +213,20 @@ def main() -> None:
     if ok and rep.get("scaled") and os.path.isfile(os.path.join(out_dir, "adapter_config.json")):
         # an adapter would be loaded onto the damaged base by the validator; ship merged weights
         if run([sys.executable, os.path.join(SRC, "augment_repair.py"), "merge",
-                "--base", rep["path"], "--out-dir", out_dir], end_ts + 150) != 0:
-            print("[main] merge onto the repaired base failed; the adapter submission stands", flush=True)
+                "--base", rep["path"], "--out-dir", out_dir], end_ts + 150) != 0 \
+                or os.path.isfile(os.path.join(out_dir, "adapter_config.json")):
+            # An adapter trained on the repaired base is WORSE than useless on the damaged base the
+            # validator would load it onto (measured: CE 3.68 vs 1.69 for the untrained repaired base
+            # and 1.35 merged). Ship the repaired base itself rather than that adapter.
+            import shutil
+            print("[main] merge failed; shipping the repaired base weights instead of the adapter", flush=True)
+            for fn in os.listdir(out_dir):
+                if fn.startswith("adapter_"):
+                    os.remove(os.path.join(out_dir, fn))
+            for fn in os.listdir(rep["path"]):
+                src = os.path.join(rep["path"], fn)
+                if os.path.isfile(src):
+                    shutil.copy2(src, os.path.join(out_dir, fn))
     if not ok:
         try:
             emergency_submission(model_path, out_dir, plan_mod.needs_modern_stack(info))

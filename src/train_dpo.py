@@ -45,6 +45,17 @@ def build_pairs(data_path: str, dt: dict) -> tuple[list[dict], list[dict]]:
     f_prompt = dt.get("field_prompt") or "prompt"
     f_chosen = dt.get("field_chosen") or "chosen"
     f_rejected = dt.get("field_rejected") or "rejected"
+    # The validator's prepared file always uses prompt/chosen/rejected, and requests.py resets the
+    # field names to match before sending — but if a task ever arrives with the dataset's original
+    # names, every row would be dropped and the run would forfeit. Fall back to the standard names.
+    if rows and isinstance(rows[0], dict):
+        first = rows[0]
+        if f_prompt not in first and "prompt" in first:
+            f_prompt = "prompt"
+        if f_chosen not in first and "chosen" in first:
+            f_chosen = "chosen"
+        if f_rejected not in first and "rejected" in first:
+            f_rejected = "rejected"
 
     train, dev = [], []
     n = len(rows)

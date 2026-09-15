@@ -60,15 +60,21 @@ class Objective:
     ratio in [0, 1] — the evaluator normalizes per function too. Weights are the task weights.
     """
 
-    def __init__(self, fns, weights, count_tokens, max_tokens, ref_texts):
+    def __init__(self, fns, weights, count_tokens, max_tokens, ref_texts, prefixes=("",)):
         self.fns, self.weights = fns, weights
+        # Completions the evaluator samples may open with a base-model token before the learned
+        # text (when the first-token distribution is left close to the base's to save KL), so a
+        # candidate is scored as the mean over those openings.
+        self.prefixes = list(prefixes) or [""]
         self.count_tokens, self.max_tokens = count_tokens, max_tokens
         cols = [self._raw(fn, ref_texts) for fn in fns]
         self.mu = [sum(c) / len(c) for c in cols]
         self.sd = []
         for c, m in zip(cols, self.mu):
             var = sum((x - m) ** 2 for x in c) / max(1, len(c) - 1)
-            self.sd.append(max(math.sqrt(var), 1e-3 * max(1.0, abs(m)), 1e-6))
+            # floor: a function the base never scores on (e.g. a format regex at 0) must not get
+            # an infinite exchange rate against the others
+            self.sd.append(max(math.sqrt(var), 0.05 * max(1.0, abs(m))))
         self.cache = {}
 
     @staticmethod
@@ -84,7 +90,8 @@ class Objective:
             return [0.0] * len(texts)
 
     def values(self, text):
-        return [self._raw(fn, [text])[0] for fn in self.fns]
+        texts = [p + text for p in self.prefixes]
+        return [sum(self._raw(fn, texts)) / len(texts) for fn in self.fns]
 
     def __call__(self, text):
         hit = self.cache.get(text)
@@ -106,10 +113,10 @@ def _render(c):
 
 
 def search(fns, weights, sources, count_tokens, ref_texts, max_tokens=240, seconds=90.0, seed=0,
-           log=print):
+           log=print, prefixes=("",)):
     """Return (best_text, utility, per-function values, objective)."""
     rng = random.Random(seed)
-    obj = Objective(fns, weights, count_tokens, max_tokens, ref_texts)
+    obj = Objective(fns, weights, count_tokens, max_tokens, ref_texts, prefixes)
     pool = set(_literals(sources)) | set(LONG_WORDS) | set(SHORT_WORDS) | set(CONNECTIVES)
     for t in ref_texts[:64]:
         pool.update(w for w in t.split()[:80] if len(w) <= 24)

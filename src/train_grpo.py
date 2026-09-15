@@ -50,6 +50,11 @@ def main() -> None:
     is_main = int(os.environ.get("RANK", "0")) == 0
     dt = json.loads(args.dataset_type)
     f_prompt = dt.get("field_prompt") or "prompt"
+    if f_prompt != "prompt":
+        with open(args.data_path) as f:
+            _peek = json.load(f)
+        if _peek and f_prompt not in _peek[0] and "prompt" in _peek[0]:
+            f_prompt = "prompt"  # prepared files always carry "prompt" (see train_dpo.build_pairs)
     # The validator renames the task's extra column to "extra_data" in BOTH the training file and
     # the test file (standardize_grpo_column_names), and its evaluator hands reward functions
     # kwargs["extra_data"]. Looking up the original name ("extra") found nothing, silently

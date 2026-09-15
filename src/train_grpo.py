@@ -50,7 +50,11 @@ def main() -> None:
     is_main = int(os.environ.get("RANK", "0")) == 0
     dt = json.loads(args.dataset_type)
     f_prompt = dt.get("field_prompt") or "prompt"
-    extra_col = dt.get("extra_column")
+    # The validator renames the task's extra column to "extra_data" in BOTH the training file and
+    # the test file (standardize_grpo_column_names), and its evaluator hands reward functions
+    # kwargs["extra_data"]. Looking up the original name ("extra") found nothing, silently
+    # dropped the column, and every affine reward returned 0 for the whole run.
+    extra_names = ["extra_data"] + ([dt["extra_column"]] if dt.get("extra_column") else [])
 
     with open(args.data_path) as f:
         rows = json.load(f)
@@ -60,10 +64,24 @@ def main() -> None:
         if not p:
             continue
         item = {"prompt": str(p)}
-        if extra_col and extra_col in row:
-            item[extra_col] = row[extra_col]
+        for name in extra_names:
+            if name in row:
+                item["extra_data"] = row[name]
+                break
         data.append(item)
-    log(f"prompts: {len(data)}")
+    n_extra = sum("extra_data" in d for d in data)
+    log(f"prompts: {len(data)} (with extra_data: {n_extra})")
+    if dt.get("extra_column") and n_extra == 0:
+        log("WARNING: task declares an extra column but no row carries it; extra_data rewards will be 0")
+
+    # Held-out prompts for validator-style checkpoint selection (see DevSelect below).
+    import random as _random
+    _random.Random(1337).shuffle(data)
+    n_dev = int(os.environ.get("SN56_GRPO_DEV") or min(128, max(0, len(data) // 10)))
+    if n_dev < 24:
+        n_dev = 0
+    dev, data = data[:n_dev], data[n_dev:]
+    log(f"dev prompts: {len(dev)} train prompts: {len(data)}")
 
     rewards = compile_rewards(dt.get("reward_functions") or [])
     if not rewards:
@@ -98,8 +116,10 @@ def main() -> None:
     p_lens = sorted(len(tokenizer(x["prompt"]).input_ids) for x in sample)
     p95 = p_lens[min(len(p_lens) - 1, int(0.95 * len(p_lens)))]
     max_prompt = min(2048, (p95 // 64 + 2) * 64)
-    budget_h = (args.end_ts - time.time()) / 3600
-    max_completion = 512 if budget_h >= 1.5 else 384
+    # The evaluator (TRL 1.5.1 GRPOConfig defaults) samples at most 256 new tokens and scores the
+    # truncated text. Training on 384-512 token rollouts optimised completions the scorer never
+    # sees and spent ~2x the generation time per step.
+    max_completion = int(os.environ.get("SN56_GRPO_MAX_COMPLETION") or 256)
 
     # Reward-function shape drives (beta, LR). Verifiable/binary rewards (code
     # execution, math correctness) tolerate much hotter LR and want a firm KL
@@ -161,7 +181,7 @@ def main() -> None:
                 return
             self.reward_ema = r if self.reward_ema is None else 0.8 * self.reward_ema + 0.2 * r
             # periodic export of improving policies (no dev set: rewards are the signal)
-            if (self.reward_ema > best["reward"] + 1e-6
+            if (selector is None and self.reward_ema > best["reward"] + 1e-6
                     and time.time() - self.last_save > 900):
                 best["reward"] = self.reward_ema
                 self.last_save = time.time()
@@ -171,6 +191,132 @@ def main() -> None:
             if time.time() > end_ts - save_margin:
                 control.should_training_stop = True
             return control
+
+    class DevSelect(TrainerCallback):
+        """Pick the shipped policy by the validator's GRPO score on held-out prompts.
+
+        The evaluator samples 2 completions per prompt (temperature 1.0, top_k 0, <=256 new
+        tokens, raw prompt), takes the weighted mean reward, and subtracts 0.5 x KL(base || model)
+        measured on the PROMPT tokens only (batch 1, truncated to 512). TRL's own KL penalises the
+        completion tokens, and the reward EMA is measured on training prompts at a different
+        length, so neither tracks what is scored. KL uses a top-k cache of the base distribution
+        taken before the first step (the model is still the base then); the lumped-tail estimate
+        is a slight lower bound on the exact KL.
+        """
+
+        TOPK = 128
+
+        def __init__(self):
+            self.base = None
+            self.t0 = None
+            self.fracs = [0.3, 0.5, 0.65, 0.8, 0.9]
+            self.done = 0
+            self.eval_cost = 0.0
+
+        def _model(self, m):
+            return trainer.accelerator.unwrap_model(m)
+
+        def _shard(self):
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                return dist.get_rank(), dist.get_world_size()
+            return 0, 1
+
+        @torch.no_grad()
+        def _prompt_logits(self, m, p):
+            enc = tokenizer(p, return_tensors="pt", truncation=True, max_length=512).to(m.device)
+            return torch.log_softmax(m(**enc, use_cache=False).logits[0].float(), -1)
+
+        def on_train_begin(self, targs, tstate, control, model=None, **kw):
+            self.t0 = time.time()
+            m = self._model(model)
+            was_training = m.training
+            m.eval()
+            rank, world = self._shard()
+            self.base = []
+            for item in dev[rank::world]:
+                lp = self._prompt_logits(m, item["prompt"])
+                top = lp.topk(self.TOPK, -1)
+                tail = torch.log1p(-top.values.exp().sum(-1).clamp(max=1 - 1e-6))
+                self.base.append((top.indices.cpu(), top.values.half().cpu(), tail.half().cpu()))
+            if was_training:
+                m.train()
+
+        @torch.no_grad()
+        def score(self, model):
+            import torch.distributed as dist
+            m = self._model(model)
+            was_training = m.training
+            m.eval()
+            rank, world = self._shard()
+            items = dev[rank::world]
+            gen = torch.Generator(device=m.device).manual_seed(1234 + rank)
+            r_sum, r_n, kl_sum = 0.0, 0, 0.0
+            bs = 8
+            pad_side = tokenizer.padding_side
+            tokenizer.padding_side = "left"
+            rng_cpu, rng_cuda = torch.get_rng_state(), torch.cuda.get_rng_state(m.device)
+            for s0 in range(0, len(items), bs):
+                chunk = items[s0:s0 + bs]
+                enc = tokenizer([c["prompt"] for c in chunk], return_tensors="pt", padding=True).to(m.device)
+                torch.manual_seed(int(torch.randint(0, 2**31 - 1, (1,), generator=gen)))
+                out = m.generate(**enc, do_sample=True, temperature=1.0, top_p=1.0, top_k=0,
+                                 max_new_tokens=256, num_return_sequences=2, use_cache=True,
+                                 pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
+                texts = tokenizer.batch_decode(out[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)
+                kw = {"prompts": [c["prompt"] for c in chunk for _ in range(2)]}
+                if chunk and "extra_data" in chunk[0]:
+                    kw["extra_data"] = [c.get("extra_data") for c in chunk for _ in range(2)]
+                total = [0.0] * len(texts)
+                for fn in rewards:  # wrappers already carry the task weights
+                    for i, v in enumerate(fn(texts, **kw)):
+                        total[i] += v
+                r_sum += sum(total)
+                r_n += len(total)
+            tokenizer.padding_side = pad_side
+            torch.set_rng_state(rng_cpu)
+            torch.cuda.set_rng_state(rng_cuda, m.device)
+            for item, (ids, lpb, tail_b) in zip(items, self.base):
+                lpf = self._prompt_logits(m, item["prompt"])
+                ids = ids.to(m.device)
+                lpb = lpb.to(m.device).float()
+                tail_b = tail_b.to(m.device).float()
+                lpf_top = lpf.gather(-1, ids)
+                tail_f = torch.log1p(-lpf_top.exp().sum(-1).clamp(max=1 - 1e-6))
+                kl_tok = (lpb.exp() * (lpb - lpf_top)).sum(-1) + tail_b.exp() * (tail_b - tail_f)
+                kl_sum += kl_tok.mean().item()
+            if was_training:
+                m.train()
+            t = torch.tensor([r_sum, r_n, kl_sum, len(items)], dtype=torch.float64, device=m.device)
+            if world > 1:
+                dist.all_reduce(t)
+            reward = t[0].item() / max(1.0, t[1].item())
+            kl = t[2].item() / max(1.0, t[3].item())
+            return reward - 0.5 * kl, reward, kl
+
+        def maybe(self, model, tstate, tag):
+            t_eval = time.time()
+            sc, rw, kl = self.score(model)
+            self.eval_cost = max(self.eval_cost, time.time() - t_eval)
+            better = sc > best["reward"] + 1e-9
+            log(f"dev[{tag}@{tstate.global_step}] score={sc:.4f} reward={rw:.4f} prompt_kl={kl:.5f} "
+                f"({time.time() - t_eval:.0f}s){' BEST' if better else ''}")
+            if better:
+                best["reward"] = sc
+                export(trainer, f"dev_score={sc:.4f}@{tstate.global_step}")
+            return better
+
+        def on_step_end(self, targs, tstate, control, model=None, **kw):
+            if self.done >= len(self.fracs) or self.t0 is None:
+                return control
+            span = (end_ts - save_margin) - self.t0
+            if time.time() - self.t0 >= self.fracs[self.done] * span:
+                self.done += 1
+                if time.time() + self.eval_cost + 120 < end_ts - save_margin:
+                    self.maybe(model, tstate, f"{self.fracs[self.done - 1]:.2f}")
+            return control
+
+    selector = DevSelect() if dev else None
 
     def build_trainer(vllm_on: bool):
         vllm_kwargs = {}
@@ -209,7 +355,7 @@ def main() -> None:
             train_dataset=Dataset.from_list(data),
             processing_class=tokenizer,
             peft_config=peft_config,
-            callbacks=[Clock()],
+            callbacks=[Clock(), selector] if selector else [Clock()],
         )
 
     # TRL's colocate vLLM path reads torchrun-style env vars even single-process
@@ -244,7 +390,17 @@ def main() -> None:
             raise
         log("OOM after an export; keeping the saved policy")
 
-    export(trainer, "final")
+    if selector is not None and selector.t0 is not None:
+        # the end-of-training policy competes on the same dev score; ship the best one
+        try:
+            if not selector.maybe(trainer.model, trainer.state, "final") and best["saved"]:
+                log(f"keeping earlier policy (dev score {best['reward']:.4f})")
+        except torch.cuda.OutOfMemoryError:
+            log("final dev scoring OOM; keeping the saved policy")
+        if not best["saved"]:
+            export(trainer, "final (no dev improvement recorded)")
+    else:
+        export(trainer, "final")
 
     cfg_path = os.path.join(args.output_dir, "config.json")
     if is_main and info["architectures"] and os.path.isfile(cfg_path):

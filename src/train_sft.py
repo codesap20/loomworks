@@ -195,7 +195,9 @@ def main() -> None:
 
     ref_model = None
     if use_kl and not lora:
-        ref_model = load_base().cuda().eval()
+        # .cuda() means cuda:0 on every rank before the Trainer sets devices: on 2+ GPUs all
+        # reference copies landed on GPU 0 (OOM there, cross-device logits everywhere else)
+        ref_model = load_base().to(f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}").eval()
         for p in ref_model.parameters():
             p.requires_grad_(False)
 

@@ -7,21 +7,20 @@ never take the training run down, so every call is fenced.
 """
 
 import math
-import types
 
 
 def _extract_callable(source: str):
     namespace: dict = {}
     exec(source, namespace)  # trusted input: the validator authored/vetted it
-    funcs = [v for k, v in namespace.items()
-             if isinstance(v, types.FunctionType) and not k.startswith("_")]
-    if not funcs:
-        raise ValueError("no function found in reward source")
-    # prefer a conventionally named one, else the last defined
-    for f in funcs:
-        if f.__name__.startswith("reward"):
-            return f
-    return funcs[-1]
+    # Pick EXACTLY what the evaluator scores: validator/tasks/rewards/functions.py
+    # validate_reward_function takes next(v for k, v in namespace.items() if callable(v)),
+    # i.e. the first callable in definition order (helpers and from-imports included).
+    # Preferring "reward*" names or the last function trained against a different function
+    # than the one being scored whenever the source defined helpers.
+    func = next((v for k, v in namespace.items() if callable(v)), None)
+    if func is None:
+        raise ValueError("no callable found in reward source")
+    return func
 
 
 def compile_rewards(reward_functions: list[dict]) -> list:
@@ -42,7 +41,11 @@ def compile_rewards(reward_functions: list[dict]) -> list:
         def make(fn=fn, weight=weight, idx=i):
             def reward(completions, **kwargs):
                 try:
-                    vals = fn(completions, **kwargs)
+                    try:
+                        vals = fn(completions, **kwargs)
+                    except TypeError:
+                        # evaluator's call_reward_func does the same fallback
+                        vals = fn(completions)
                 except Exception as e:
                     print(f"[rewards] fn{idx} raised {type(e).__name__}: {e}", flush=True)
                     return [0.0] * len(completions)

@@ -39,7 +39,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.num_gpus > 1 and "RANK" not in os.environ:
+    distill_mode = os.environ.get("SN56_GRPO_MODE") == "distill"
+    if args.num_gpus > 1 and "RANK" not in os.environ and not distill_mode:
         os.execvp("torchrun", ["torchrun", "--nproc_per_node", str(args.num_gpus),
                                os.path.abspath(__file__)] + sys.argv[1:])
 
@@ -109,6 +110,43 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path, torch_dtype=torch.bfloat16, attn_implementation=attn)
     model.config.use_cache = False
+
+    # Oracle distillation (grpo_distill.py). Only for prompt-independent rewards: a task whose
+    # rewards read extra_data scores against per-prompt answers, which one string cannot hit.
+    if distill_mode and not any("extra_data" in d for d in data):
+        import grpo_distill
+        from reward_compile import _extract_callable
+        fns, weights, sources = [], [], []
+        for spec in dt.get("reward_functions") or []:
+            try:
+                fns.append(_extract_callable(spec["reward_func"]))
+                weights.append(float(spec.get("reward_weight", 1.0)))
+                sources.append(spec["reward_func"])
+            except Exception as e:
+                log(f"distill: reward function skipped ({type(e).__name__}: {e})")
+
+        def save_distilled(m, tag):
+            os.makedirs(args.output_dir, exist_ok=True)
+            m.save_pretrained(args.output_dir)
+            tokenizer.save_pretrained(args.output_dir)
+            paths.patch_adapter_base(args.output_dir, args.base_model_id)
+            log(f"exported {tag}")
+
+        model.cuda()
+        result = None
+        try:
+            result = grpo_distill.run(model, tokenizer, [d["prompt"] for d in data], [d["prompt"] for d in dev],
+                                      fns, weights, sources, args.end_ts, save_distilled, log, False)
+        except Exception as e:
+            log(f"distill failed ({type(e).__name__}: {e}); falling back to GRPO")
+        if result is not None:
+            log("done")
+            return
+        del model
+        torch.cuda.empty_cache()
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path, torch_dtype=torch.bfloat16, attn_implementation=attn)
+        model.config.use_cache = False
 
     peft_config = None
     if use_lora:

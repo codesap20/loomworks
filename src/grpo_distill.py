@@ -53,6 +53,19 @@ def _means(fns, texts):
     return [sum(v) / max(1, len(v)) for v in (grpo_oracle.Objective._raw(fn, texts) for fn in fns)]
 
 
+def _reward_safe(fns, texts):
+    """True when every reward function survives these completions.
+
+    The evaluator catches only TypeError, so a reward function raising on what our policy emits
+    would fail the whole repo on that task — worse than any score. Checked on real samples.
+    """
+    for fn in fns:
+        for i in range(0, len(texts), 16):
+            if grpo_oracle.Objective._raw(fn, texts[i:i + 16], strict=True) is None:
+                return False
+    return True
+
+
 @torch.no_grad()
 def _prompt_kl(model, tok, prompts):
     """Evaluator's KL: KL(base || model) over all prompt positions, batch 1, truncation 512."""
@@ -200,6 +213,9 @@ def run(model, tok, train_prompts, dev_prompts, fns, weights, sources, end_ts, s
             step += 1
         m.eval()
         txt = _sample(m, tok, dev, gens=2, seed=7)
+        if not _reward_safe(fns, txt):
+            say(f"candidate {name}: a reward function raises on its completions; discarding it")
+            continue
         res = {"name": name, "alpha": alpha, "steps": step, "means": _means(fns, txt), "kl": _prompt_kl(m, tok, dev)}
         out = os.path.join(work_dir, f"cand_{name}")
         shutil.rmtree(out, ignore_errors=True)

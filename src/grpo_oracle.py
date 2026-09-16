@@ -78,7 +78,13 @@ class Objective:
         self.cache = {}
 
     @staticmethod
-    def _raw(fn, texts):
+    def _raw(fn, texts, strict=False):
+        """Values for `texts`, or None when the function raised and `strict`.
+
+        The evaluator only catches TypeError (evaluators/grpo.py call_reward_func); anything else a
+        reward function raises propagates and the whole repo scores nothing on that task. So a
+        candidate string that makes any reward function blow up must never be selected.
+        """
         try:
             try:
                 vals = fn(list(texts))
@@ -87,21 +93,27 @@ class Objective:
             return [float(v) if v is not None and not (isinstance(v, float) and math.isnan(v)) else 0.0
                     for v in vals]
         except Exception:
-            return [0.0] * len(texts)
+            return None if strict else [0.0] * len(texts)
 
-    def values(self, text):
+    def values(self, text, strict=False):
         texts = [p + text for p in self.prefixes]
-        return [sum(self._raw(fn, texts)) / len(texts) for fn in self.fns]
+        out = []
+        for fn in self.fns:
+            vals = self._raw(fn, texts, strict=strict)
+            if vals is None:
+                return None
+            out.append(sum(vals) / len(texts))
+        return out
 
     def __call__(self, text):
         hit = self.cache.get(text)
         if hit is not None:
             return hit
         n_tok = self.count_tokens(text)
-        if n_tok > self.max_tokens:
+        v = None if n_tok > self.max_tokens else self.values(text, strict=True)
+        if v is None:           # too long, or a reward function raised on it
             u = -1e9 - n_tok
         else:
-            v = self.values(text)
             u = sum(w * (x - m) / s for w, x, m, s in zip(self.weights, v, self.mu, self.sd))
         self.cache[text] = u
         return u

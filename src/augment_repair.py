@@ -174,6 +174,27 @@ def _token_batches(tok_dir: str, device, n_rows=24, max_len=1024):
     return out
 
 
+def probe_base_ce(model_path: str, tok_dir: str) -> float | None:
+    """Mean CE of the (possibly damaged) base on a few training rows.
+
+    Heavy gaussian noise or layer re-init leaves a model whose CE on its own task data is several
+    times normal (Qwen3-0.6B chat: clean 1.69, noise .30 -> 12.26, reinit .10 -> 11.98). Those
+    cases cannot be undone, but the regime still matters: measured after full training, full-ft
+    beats our chat LoRA default by 0.23 nats on noise .30 and 0.04 on reinit .05 (771-1, 641-56).
+    """
+    if not torch.cuda.is_available():
+        return None
+    from transformers import AutoModelForCausalLM
+    model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, device_map="cuda:0")
+    model.eval()
+    try:
+        batches = _token_batches(tok_dir, "cuda:0")
+        return _batch_ce(model, batches) if batches else None
+    finally:
+        del model
+        torch.cuda.empty_cache()
+
+
 def maybe_repair(model_path: str, work_root: str, tok_dir: str, log=print) -> tuple[str, dict]:
     """Return (path to train from, report). Never raises: any failure trains from the original.
 
@@ -199,6 +220,13 @@ def maybe_repair(model_path: str, work_root: str, tok_dir: str, log=print) -> tu
         total = sum(st["numel"] for st in stats.values())
         if not hyps or ratio > float(os.environ.get("SN56_AUG_MAX_RATIO") or 0.55):
             log(f"[augment] no weight scaling (best c={c:.3f}, fit ratio {ratio:.2f})")
+            if total <= 8e9:
+                try:
+                    report["base_ce"] = probe_base_ce(model_path, tok_dir)
+                    if report["base_ce"] is not None:
+                        log(f"[augment] base CE on training rows: {report['base_ce']:.3f}")
+                except Exception as e:
+                    log(f"[augment] base CE probe skipped ({type(e).__name__}: {e})")
             return model_path, report
         if total > 30e9 or not torch.cuda.is_available():
             log(f"[augment] scaling pattern (c={c:.3f}, ratio {ratio:.2f}) but cannot verify here; unchanged")
@@ -221,7 +249,7 @@ def maybe_repair(model_path: str, work_root: str, tok_dir: str, log=print) -> tu
         del model, params
         torch.cuda.empty_cache()
         ce_best, c_best, names_best = min(results, key=lambda x: x[0])
-        report.update({"ce_before": ce0, "ce_hyp": [r[0] for r in results]})
+        report.update({"ce_before": ce0, "ce_hyp": [r[0] for r in results], "base_ce": ce0})
         log(f"[augment] RMS pattern c={c:.3f} (ratio {ratio:.2f}); CE {ce0:.4f} -> "
             f"{' / '.join(f'{r[0]:.4f} (c={r[1]:.3f}, {len(r[2])} tensors)' for r in results)}")
         if ce_best > ce0 - max(0.02, 0.01 * ce0):
@@ -244,7 +272,7 @@ def maybe_repair(model_path: str, work_root: str, tok_dir: str, log=print) -> tu
         except BaseException:
             shutil.rmtree(tmp, ignore_errors=True)   # never leave a partial model to train from
             raise
-        report.update({"scaled": True, "c": c_best, "flagged": len(names_best)})
+        report.update({"scaled": True, "c": c_best, "flagged": len(names_best), "base_ce": ce_best})
         log(f"[augment] weight scaling undone: c={c_best:.3f} on {len(names_best)}/{len(stats)} tensors "
             f"(CE {ce0:.4f} -> {ce_best:.4f}); training from {out}")
         return out, report

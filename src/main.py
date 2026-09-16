@@ -255,7 +255,14 @@ def main() -> None:
                 # data scale we measured (see plan.choose_regime). This matters most on the
                 # continuous-SFT gate: it is a ChatTask on 4xH100 where our memory rule
                 # would otherwise pick full-ft, while the champion runs LoRA there.
-                sft_env["SN56_ADAPTER_PREF"] = os.environ.get("SN56_ADAPTER_PREF", "lora")
+                _ce = (repair["report"] or {}).get("base_ce")
+                if _ce is not None and _ce >= float(os.environ.get("SN56_BROKEN_CE") or 4.0):
+                    # heavily damaged base (noise / re-init we cannot undo): LoRA cannot rebuild it.
+                    # Measured: full-ft 1.821 vs LoRA 2.052 on noise .30, 1.493 vs 1.534 on reinit .05.
+                    print(f"[main] base CE {_ce:.2f} says the base is badly damaged; "
+                          "dropping the chat LoRA preference", flush=True)
+                else:
+                    sft_env["SN56_ADAPTER_PREF"] = os.environ.get("SN56_ADAPTER_PREF", "lora")
             return run([sys.executable, os.path.join(SRC, "train_sft.py"),
                         *common, "--tokenized-dir", tok_dir], end_ts, sft_env)
 

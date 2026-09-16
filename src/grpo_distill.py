@@ -140,9 +140,15 @@ def run(model, tok, train_prompts, dev_prompts, fns, weights, sources, end_ts, s
                                              log=say, prompts=train_prompts[:8])
     robust, u_r, _, _ = grpo_oracle.search(fns, weights, sources, count, refs, seconds=search_s / 2, log=say,
                                            prefixes=prefixes, prompts=train_prompts[:8])
-    cands = [("anchored", anchored, float(os.environ.get("SN56_DISTILL_ALPHA") or 0.3)), ("robust", robust, 1.0)]
+    alpha0 = float(os.environ.get("SN56_DISTILL_ALPHA") or 0.3)
+    # Three candidates, in priority order. Once every reward function is won on rank, the score is
+    # decided purely by 0.5 * prompt-KL, so a KL-tightened variant of the anchored string is worth
+    # training whenever the budget allows: same text, heavier leash on the interior prompt positions.
+    cands = [("anchored", anchored, alpha0, lam),
+             ("robust", robust, 1.0, lam),
+             ("anchored_lowkl", anchored, alpha0, lam * float(os.environ.get("SN56_DISTILL_LAM_MULT") or 4.0))]
     if anchored == robust:
-        cands = cands[:1]
+        cands = [cands[0], cands[2]]
 
     dev = (dev_prompts or train_prompts[-128:])[:int(os.environ.get("SN56_DISTILL_DEV") or 64)]
     with torch.no_grad():
@@ -158,7 +164,7 @@ def run(model, tok, train_prompts, dev_prompts, fns, weights, sources, end_ts, s
     peft_model = None
     results = []
     cost = None
-    for idx, (name, text, alpha) in enumerate(cands):
+    for idx, (name, text, alpha, lam_c) in enumerate(cands):
         if cost is not None and time.time() + cost + reserve > end_ts:
             say(f"no time for candidate {name}")
             break
@@ -170,7 +176,7 @@ def run(model, tok, train_prompts, dev_prompts, fns, weights, sources, end_ts, s
             peft_model.set_adapter(name)
         m = peft_model
         tgt = tok(text, add_special_tokens=False).input_ids + [tok.eos_token_id]
-        say(f"candidate {name}: alpha={alpha} target {len(tgt)} tokens {text[:80]!r}")
+        say(f"candidate {name}: alpha={alpha} lam={lam_c} target {len(tgt)} tokens {text[:80]!r}")
         params = [p for n_, p in m.named_parameters() if p.requires_grad and f".{name}." in n_]
         for n_, p in m.named_parameters():
             if "lora_" in n_ and f".{name}." not in n_:
@@ -216,7 +222,7 @@ def run(model, tok, train_prompts, dev_prompts, fns, weights, sources, end_ts, s
                 first.append(-(q * lpf[L - 1]).sum())
             loss = torch.stack(ce).mean() + torch.stack(first).mean()
             if kl:
-                loss = loss + lam * torch.stack(kl).mean()
+                loss = loss + lam_c * torch.stack(kl).mean()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
@@ -246,10 +252,13 @@ def run(model, tok, train_prompts, dev_prompts, fns, weights, sources, end_ts, s
     if not results:
         return None
     best = results[0]
-    if len(results) == 2:
-        s0, s1 = pair_scores(results[0], results[1], weights)
-        best = results[0] if s0 >= s1 else results[1]
-        say(f"1v1 on dev: {results[0]['name']} {s0:.4f} vs {results[1]['name']} {s1:.4f} -> {best['name']}")
+    for challenger in results[1:]:
+        s_b, s_c = pair_scores(best, challenger, weights)
+        say(f"1v1 on dev: {best['name']} {s_b:.4f} vs {challenger['name']} {s_c:.4f}")
+        if s_c > s_b:
+            best = challenger
+    if len(results) > 1:
+        say(f"shipping {best['name']}")
     sb_ours, sb_base = pair_scores(best, base, weights)
     say(f"{best['name']} vs base on dev: {sb_ours:.4f} vs {sb_base:.4f} ({time.time() - t_start:.0f}s total)")
     import math as _math

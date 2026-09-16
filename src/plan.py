@@ -31,8 +31,12 @@ def probe_model(model_path: str) -> dict:
             "max_positions": None, "architectures": []}
     cfg_path = os.path.join(model_path, "config.json")
     if os.path.isfile(cfg_path):
-        with open(cfg_path) as f:
-            cfg = json.load(f)
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+        except Exception as e:
+            print(f"[plan] unreadable config.json ({type(e).__name__}: {e})", flush=True)
+            cfg = {}
         # multimodal-style configs nest the text config
         text_cfg = cfg.get("text_config", cfg)
         info["model_type"] = cfg.get("model_type")
@@ -81,7 +85,7 @@ def needs_modern_stack(model_info: dict) -> bool:
             if mt not in CONFIG_MAPPING_NAMES:
                 return True
         except Exception:
-            pass
+            return True   # cannot tell -> assume the legacy stack cannot load it (lfm2 lesson)
     return False
 
 

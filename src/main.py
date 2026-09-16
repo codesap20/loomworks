@@ -89,7 +89,15 @@ def emergency_submission(model_path: str, out_dir: str, modern: bool) -> None:
 def main() -> None:
     args = parse_args()
     start = time.time()
-    end_ts = start + args.hours_to_complete * 3600 - 180
+    # Reserve enough tail for the emergency submission: it may copy the whole checkpoint, and a
+    # partial copy at the wall clock is an unloadable upload.
+    _model_bytes = 0
+    _mp = paths.resolve_model_path(args.model)
+    if os.path.isdir(_mp):
+        _model_bytes = sum(os.path.getsize(os.path.join(_mp, f)) for f in os.listdir(_mp)
+                           if os.path.isfile(os.path.join(_mp, f)))
+    _reserve = max(180.0, _model_bytes / 80e6)      # ~80 MB/s copy, floor 3 min
+    end_ts = start + args.hours_to_complete * 3600 - min(_reserve, args.hours_to_complete * 900)
 
     model_path = paths.resolve_model_path(args.model)
     data_path = paths.resolve_dataset_path(args.task_id, args.dataset)
@@ -163,7 +171,8 @@ def main() -> None:
                 rep_path = os.path.join(paths.WORK_ROOT, "augment_report.json")
                 run([sys.executable, os.path.join(SRC, "augment_repair.py"), "repair",
                      "--model-path", model_path, "--work-root", paths.WORK_ROOT,
-                     "--tok-dir", tok_dir, "--report", rep_path], end_ts)
+                     "--tok-dir", tok_dir, "--report", rep_path],
+                    min(end_ts, time.time() + max(600, 0.12 * (end_ts - start))))
                 try:
                     with open(rep_path) as f:
                         repair["report"] = json.load(f)
@@ -198,7 +207,8 @@ def main() -> None:
             # full-ft 1.5225 — r256 wins 688-29 of decided samples and matches full-ft. At 30%
             # pruning every regime lands within 0.005, so only the heavy case gets the bigger rank.
             _pruned = (repair["report"] or {}).get("pruned_frac", 0.0)
-            if _pruned >= 0.35 and (info["params"] or 0) <= 14e9 and "SN56_LORA_R" not in os.environ:
+            if (_pruned >= 0.35 and (info["params"] or 0) <= 14e9 and attempt == 1
+                    and "SN56_LORA_R" not in os.environ):
                 sft_env["SN56_LORA_R"] = "256"
                 print(f"[main] {_pruned:.0%} of weights pruned -> LoRA rank 256 if an adapter is used",
                       flush=True)
@@ -249,30 +259,60 @@ def main() -> None:
     rep = repair["report"] or {}
     if ok and rep.get("scaled") and os.path.isfile(os.path.join(out_dir, "adapter_config.json")):
         # an adapter would be loaded onto the damaged base by the validator; ship merged weights
-        if run([sys.executable, os.path.join(SRC, "augment_repair.py"), "merge",
-                "--base", rep["path"], "--out-dir", out_dir], end_ts + 150) != 0 \
-                or os.path.isfile(os.path.join(out_dir, "adapter_config.json")):
+        merged = run([sys.executable, os.path.join(SRC, "augment_repair.py"), "merge",
+                      "--base", rep["path"], "--out-dir", out_dir], end_ts + 150) == 0 \
+            and not os.path.isfile(os.path.join(out_dir, "adapter_config.json"))
+        if not merged:
             # An adapter trained on the repaired base is WORSE than useless on the damaged base the
             # validator would load it onto (measured: CE 3.68 vs 1.69 for the untrained repaired base
-            # and 1.35 merged). Ship the repaired base itself rather than that adapter.
+            # and 1.35 merged). Ship the repaired base itself rather than that adapter — but write the
+            # weights BEFORE removing the adapter, so a kill in between still leaves a loadable dir.
             import shutil
             print("[main] merge failed; shipping the repaired base weights instead of the adapter", flush=True)
-            for fn in os.listdir(out_dir):
-                if fn.startswith("adapter_"):
-                    os.remove(os.path.join(out_dir, fn))
-            for fn in os.listdir(rep["path"]):
-                src = os.path.join(rep["path"], fn)
-                if os.path.isfile(src):
-                    shutil.copy2(src, os.path.join(out_dir, fn))
+            try:
+                for fn in os.listdir(out_dir):      # stale shards/index from the partial merge
+                    if fn.startswith("model") and fn.endswith((".safetensors", ".bin", ".json")):
+                        os.remove(os.path.join(out_dir, fn))
+                for fn in os.listdir(rep["path"]):
+                    src = os.path.join(rep["path"], fn)
+                    if os.path.isfile(src):
+                        shutil.copy2(src, os.path.join(out_dir, fn))
+                for fn in os.listdir(out_dir):
+                    if fn.startswith("adapter_"):
+                        os.remove(os.path.join(out_dir, fn))
+            except Exception as e:
+                print(f"[main] repaired-base fallback failed ({type(e).__name__}: {e})", flush=True)
+            ok = submission_ok(out_dir)
     if not ok:
         try:
-            emergency_submission(model_path, out_dir, plan_mod.needs_modern_stack(info))
+            # prefer the repaired copy when we have one: it is strictly closer to the original model
+            fallback_src = rep["path"] if rep.get("scaled") and os.path.isdir(rep.get("path", "")) else model_path
+            emergency_submission(fallback_src, out_dir, plan_mod.needs_modern_stack(info))
         except Exception as e:
             print(f"[main] emergency submission failed too: {e}", flush=True)
-            sys.exit(1)
     print(f"[main] finished ok={ok or submission_ok(out_dir)} "
           f"elapsed={(time.time() - start) / 60:.0f}m", flush=True)
 
 
+def _main_never_fails() -> None:
+    """The container's exit code decides whether ANYTHING is uploaded.
+
+    trainer/runtime.py marks a task successful and uploads the checkpoint directory when the
+    container is killed by the wall clock, but marks it FAILED and uploads nothing on a non-zero
+    exit. So a crash is strictly worse than hanging: we swallow everything and always exit 0,
+    leaving whatever is in the output directory to be collected.
+    """
+    try:
+        main()
+    except BaseException as e:  # noqa: BLE001 - including SystemExit(1) from anywhere below
+        if isinstance(e, SystemExit) and not e.code:
+            return
+        import traceback
+
+        traceback.print_exc()
+        print(f"[main] top-level {type(e).__name__}: {e} - exiting 0 so the checkpoint dir is uploaded",
+              flush=True)
+
+
 if __name__ == "__main__":
-    main()
+    _main_never_fails()

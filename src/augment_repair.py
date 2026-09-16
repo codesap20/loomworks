@@ -185,6 +185,8 @@ def maybe_repair(model_path: str, work_root: str, tok_dir: str, log=print) -> tu
     try:
         stats = scan(model_path)
         if not stats:
+            if any(f.endswith(".bin") for f in os.listdir(model_path)):
+                log("[augment] checkpoint has no safetensors shards; scaling repair skipped")
             return model_path, report
         zero = [n for n, st in stats.items() if st["zero_frac"] > 0.01]
         if zero:
@@ -225,13 +227,23 @@ def maybe_repair(model_path: str, work_root: str, tok_dir: str, log=print) -> tu
         if ce_best > ce0 - max(0.02, 0.01 * ce0):
             log("[augment] no hypothesis lowers CE clearly; training from the original")
             return model_path, report
+        need = sum(os.path.getsize(os.path.join(model_path, f)) for f in os.listdir(model_path)
+                   if os.path.isfile(os.path.join(model_path, f)))
         free = shutil.disk_usage(work_root if os.path.isdir(work_root) else "/").free
-        if free < 2.5 * total + (2 << 30):
-            log(f"[augment] repair needs disk ({free / 2**30:.0f} GiB free); training from the original")
+        if free < need * 1.15 + (2 << 30):
+            log(f"[augment] repair needs {need / 2**30:.1f} GiB, only {free / 2**30:.1f} GiB free; "
+                "training from the original")
             return model_path, report
         out = os.path.join(work_root, "repaired_model")
+        tmp = out + ".tmp"
         shutil.rmtree(out, ignore_errors=True)
-        write_repaired(model_path, out, c_best, names_best, stats)
+        shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            write_repaired(model_path, tmp, c_best, names_best, stats)
+            os.replace(tmp, out)
+        except BaseException:
+            shutil.rmtree(tmp, ignore_errors=True)   # never leave a partial model to train from
+            raise
         report.update({"scaled": True, "c": c_best, "flagged": len(names_best)})
         log(f"[augment] weight scaling undone: c={c_best:.3f} on {len(names_best)}/{len(stats)} tensors "
             f"(CE {ce0:.4f} -> {ce_best:.4f}); training from {out}")

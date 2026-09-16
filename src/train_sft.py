@@ -356,8 +356,9 @@ def main() -> None:
                 if mask.any():
                     with torch.no_grad():
                         if lora:
-                            with model.disable_adapter():
-                                ref_logits = model(
+                            _m = self.accelerator.unwrap_model(model)
+                            with _m.disable_adapter():
+                                ref_logits = _m(
                                     input_ids=inputs["input_ids"],
                                     attention_mask=inputs.get("attention_mask")).logits
                         else:
@@ -437,6 +438,10 @@ def main() -> None:
     soup_enabled = (os.environ.get("SN56_USE_SOUP") == "1"
                     and regime["dist"] in ("single", "single-offload", "ddp", "zero3"))
     soup_k = int(os.environ.get("SN56_SOUP_K") or 4)
+    if regime["adapter"] is None and not soup_disk_default(info["params"]):
+        # bf16 CPU snapshots of every trainable: 4 of them for a 7B full-ft is ~55 GiB of host RAM
+        # on top of ema/raw/fp32 copies, and a host OOM kill loses the task outright.
+        soup_k = 4 if (info["params"] or 0) <= 3e9 else 2 if (info["params"] or 0) <= 8e9 else 1
     # greedy = test each candidate against dev and keep it if dev improves (k selection
     # passes); uniform = average the pool once and read dev once (1 pass). See the soup
     # block for the measurement that motivates having the choice.
@@ -545,6 +550,10 @@ def main() -> None:
 
         def on_evaluate(self, targs, tstate, control, metrics=None, **kw):
             loss = (metrics or {}).get("eval_loss")
+            if loss is not None and not math.isfinite(loss):
+                log(f"dev loss is {loss}: diverged, stopping training")
+                control.should_training_stop = True
+                return
             if loss is None or final_phase["on"]:
                 # final selection re-uses trainer.evaluate(); those readings must not
                 # pool/slot/export/early-stop — the final block exports the winner itself
@@ -967,41 +976,19 @@ def main() -> None:
     if best["saved_at"] == 0.0 and not os.path.isdir(args.output_dir):
         export(trainer, "fallback-final")
 
-    # Champion-style final pass over the held-out dev rows (its dev_pass.py: 1 epoch at 0.25x LR).
-    # Those rows are real training data we never fit, but spending them ends selection: after this
-    # there is no clean held-out set, so it ships blind. DEFAULT OFF until measured.
-    # its own deadline: save_margin is what STOPS training, so reusing it here would leave no time
-    dp_deadline = args.end_ts - max(60, save_margin // 3)
-    if (os.environ.get("SN56_DEV_PASS") == "1" and len(dev_ds) >= 16
-            and time.time() < dp_deadline):
-        try:
-            from torch.utils.data import DataLoader
-            dp_lr = peak_lr * float(os.environ.get("SN56_DEV_PASS_LR_MULT") or 0.25)
-            loader = DataLoader(dev_ds.remove_columns(
-                [c for c in dev_ds.column_names if c not in ("input_ids", "labels", "attention_mask")]),
-                batch_size=micro_bs, shuffle=True, collate_fn=pad_collator)
-            opt = torch.optim.AdamW([p_ for p_ in trainer.model.parameters() if p_.requires_grad], lr=dp_lr)
-            trainer.model.train()
-            n = 0
-            for batch in loader:
-                if time.time() > dp_deadline:
-                    break
-                batch = {k: v.to(trainer.model.device) for k, v in batch.items()}
-                loss = trainer.model(**batch).loss
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), 1.0)
-                opt.step()
-                opt.zero_grad(set_to_none=True)
-                n += 1
-            log(f"dev_pass: {n} steps at lr {dp_lr:.2e} over {len(dev_ds)} held-out rows")
-            export(trainer, "dev_pass")
-        except Exception as e:
-            log(f"dev_pass failed ({type(e).__name__}: {e}); keeping the selected checkpoint")
+    # (SN56_DEV_PASS removed 2026-09-16: measured WORSE than the selected checkpoint — base 0.98598
+    # vs dev_pass 0.98801, losing 78-30 of decided samples — and it shipped an unvalidated model,
+    # since spending the dev rows leaves nothing to check the result against.)
 
     if is_main:
         with open(os.path.join(os.path.dirname(args.output_dir), "success.txt"), "w") as f:
             f.write(f"{picked} {best['loss']}\n")
     log("done")
+
+
+def soup_disk_default(params) -> bool:
+    """zero3 already spills soup candidates to disk; only in-RAM pools need the size cap."""
+    return False
 
 
 def _patch_architectures(out_dir: str, architectures: list) -> None:

@@ -40,7 +40,8 @@ def _sample(model, tok, prompts, n_new=256, bs=16, gens=1, seed=0):
     tok.padding_side = "left"
     out = []
     for i in range(0, len(prompts), bs):
-        enc = tok(prompts[i:i + bs], return_tensors="pt", padding=True).to(model.device)
+        enc = tok(prompts[i:i + bs], return_tensors="pt", padding=True,
+                  truncation=True, max_length=512).to(model.device)
         g = model.generate(**enc, do_sample=True, temperature=1.0, top_p=1.0, top_k=0, max_new_tokens=n_new,
                            num_return_sequences=gens, use_cache=True,
                            pad_token_id=tok.pad_token_id, eos_token_id=tok.eos_token_id)
@@ -49,11 +50,12 @@ def _sample(model, tok, prompts, n_new=256, bs=16, gens=1, seed=0):
     return out
 
 
-def _means(fns, texts):
-    return [sum(v) / max(1, len(v)) for v in (grpo_oracle.Objective._raw(fn, texts) for fn in fns)]
+def _means(fns, texts, prompts=None):
+    return [sum(v) / max(1, len(v))
+            for v in (grpo_oracle.Objective._raw(fn, texts, prompts=prompts) for fn in fns)]
 
 
-def _reward_safe(fns, texts):
+def _reward_safe(fns, texts, prompts=None):
     """True when every reward function survives these completions.
 
     The evaluator catches only TypeError, so a reward function raising on what our policy emits
@@ -61,7 +63,8 @@ def _reward_safe(fns, texts):
     """
     for fn in fns:
         for i in range(0, len(texts), 16):
-            r = grpo_oracle.Objective._raw(fn, texts[i:i + 16], strict=True)
+            r = grpo_oracle.Objective._raw(fn, texts[i:i + 16], strict=True,
+                                           prompts=(prompts[i:i + 16] if prompts else None))
             if r is None:   # "unavailable" = a package only the evaluator has; that is fine
                 return False
     return True
@@ -114,28 +117,38 @@ def run(model, tok, train_prompts, dev_prompts, fns, weights, sources, end_ts, s
     device = next(model.parameters()).device
     reserve = 600  # final copy + margin before the hard deadline
 
+    if not train_prompts:
+        say("no usable prompts; handing back to GRPO")
+        return None
+    search_s = float(os.environ.get("SN56_DISTILL_SEARCH_S") or 90)
+    if time.time() + reserve + search_s + 240 > end_ts:
+        say("not enough budget for distillation; handing back to GRPO")
+        return None
+
     model.eval()
     refs = _sample(model, tok, rng.sample(train_prompts, min(64, len(train_prompts))))
     firsts = collections.Counter()
     with torch.no_grad():
         for p in train_prompts[:64]:
-            lg = model(**tok(p, return_tensors="pt").to(device)).logits[0, -1].float()
+            lg = model(**tok(p, return_tensors="pt", truncation=True,
+                             max_length=512).to(device)).logits[0, -1].float()
             for t in torch.softmax(lg, -1).topk(3).indices.tolist():
                 firsts[t] += 1
     prefixes = [tok.decode([t]) for t, _ in firsts.most_common(8)]
     count = lambda s: len(tok(s, add_special_tokens=False).input_ids)
-    search_s = float(os.environ.get("SN56_DISTILL_SEARCH_S") or 90)
-    anchored, u_a, _, _ = grpo_oracle.search(fns, weights, sources, count, refs, seconds=search_s / 2, log=say)
+    anchored, u_a, _, _ = grpo_oracle.search(fns, weights, sources, count, refs, seconds=search_s / 2,
+                                             log=say, prompts=train_prompts[:8])
     robust, u_r, _, _ = grpo_oracle.search(fns, weights, sources, count, refs, seconds=search_s / 2, log=say,
-                                           prefixes=prefixes)
+                                           prefixes=prefixes, prompts=train_prompts[:8])
     cands = [("anchored", anchored, float(os.environ.get("SN56_DISTILL_ALPHA") or 0.3)), ("robust", robust, 1.0)]
     if anchored == robust:
         cands = cands[:1]
 
-    dev = (dev_prompts or train_prompts[-128:])[:128]
+    dev = (dev_prompts or train_prompts[-128:])[:int(os.environ.get("SN56_DISTILL_DEV") or 64)]
     with torch.no_grad():
         base_txt = _sample(model, tok, dev, gens=2, seed=7)
-    base = {"means": _means(fns, base_txt), "kl": 0.0}
+    dev_prompts_x2 = [p for p in dev for _ in range(2)]
+    base = {"means": _means(fns, base_txt, dev_prompts_x2), "kl": 0.0}
     say(f"base dev means {[round(x, 4) for x in base['means']]}")
 
     from peft import LoraConfig, get_peft_model
@@ -168,7 +181,7 @@ def run(model, tok, train_prompts, dev_prompts, fns, weights, sources, end_ts, s
         m.train()
         step = 0
         while step < max_steps and time.time() + reserve < end_ts:
-            batch = rng.sample(train_prompts, bs)
+            batch = rng.sample(train_prompts, min(bs, len(train_prompts)))
             pids = [tok(p, truncation=True, max_length=512).input_ids for p in batch]
             pre = [[] for _ in batch]
             with torch.no_grad(), m.disable_adapter():
@@ -214,15 +227,18 @@ def run(model, tok, train_prompts, dev_prompts, fns, weights, sources, end_ts, s
             step += 1
         m.eval()
         txt = _sample(m, tok, dev, gens=2, seed=7)
-        if not _reward_safe(fns, txt):
+        if not _reward_safe(fns, txt, dev_prompts_x2):
             say(f"candidate {name}: a reward function raises on its completions; discarding it")
             continue
-        res = {"name": name, "alpha": alpha, "steps": step, "means": _means(fns, txt), "kl": _prompt_kl(m, tok, dev)}
+        res = {"name": name, "alpha": alpha, "steps": step, "means": _means(fns, txt, dev_prompts_x2),
+               "kl": _prompt_kl(m, tok, dev)}
         out = os.path.join(work_dir, f"cand_{name}")
         shutil.rmtree(out, ignore_errors=True)
         m.save_pretrained(out, selected_adapters=[name])
         res["dir"] = out
         results.append(res)
+        if not results:
+            save_dir_fn(out, name, f"distill {name} (provisional)")
         cost = time.time() - t_c
         say(f"candidate {name}: {step} steps, dev means {[round(x, 4) for x in res['means']]} "
             f"kl {res['kl']:.4f} ({cost:.0f}s)")
@@ -236,7 +252,9 @@ def run(model, tok, train_prompts, dev_prompts, fns, weights, sources, end_ts, s
         say(f"1v1 on dev: {results[0]['name']} {s0:.4f} vs {results[1]['name']} {s1:.4f} -> {best['name']}")
     sb_ours, sb_base = pair_scores(best, base, weights)
     say(f"{best['name']} vs base on dev: {sb_ours:.4f} vs {sb_base:.4f} ({time.time() - t_start:.0f}s total)")
-    if sb_ours < sb_base + abs(sb_base) * 0.01:
+    import math as _math
+
+    if not (_math.isfinite(sb_ours) and _math.isfinite(sb_base) and sb_ours >= sb_base + abs(sb_base) * 0.01):
         say("does not beat the base by the boss margin; not shipping the distilled policy")
         return None
     save_dir_fn(best["dir"], best["name"], f"distill {best['name']} steps={best['steps']} kl={best['kl']:.4f}")

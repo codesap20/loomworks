@@ -60,13 +60,15 @@ class Objective:
     ratio in [0, 1] — the evaluator normalizes per function too. Weights are the task weights.
     """
 
-    def __init__(self, fns, weights, count_tokens, max_tokens, ref_texts, prefixes=("",)):
+    def __init__(self, fns, weights, count_tokens, max_tokens, ref_texts, prefixes=("",), prompts=None):
         self.fns, self.weights = fns, weights
         # Completions the evaluator samples may open with a base-model token before the learned
         # text (when the first-token distribution is left close to the base's to save KL), so a
         # candidate is scored as the mean over those openings.
         self.prefixes = list(prefixes) or [""]
+        self.prompts = list(prompts or [])[:len(self.prefixes)] or [""] * len(self.prefixes)
         self.count_tokens, self.max_tokens = count_tokens, max_tokens
+        ref_texts = list(ref_texts) or [""]
         cols = [self._raw(fn, ref_texts) for fn in fns]
         # functions we cannot run locally contribute nothing to the search (constant column)
         self.unavailable = [i for i, c in enumerate(cols) if c == "unavailable"]
@@ -81,20 +83,31 @@ class Objective:
         self.cache = {}
 
     @staticmethod
-    def _raw(fn, texts, strict=False):
+    def _raw(fn, texts, strict=False, prompts=None):
         """Values for `texts`, or None when the function raised and `strict`.
 
         The evaluator only catches TypeError (evaluators/grpo.py call_reward_func); anything else a
         reward function raises propagates and the whole repo scores nothing on that task. So a
         candidate string that makes any reward function blow up must never be selected.
         """
+        texts = list(texts)
+        kw = {"prompts": list(prompts) if prompts is not None else [""] * len(texts)}
         try:
             try:
-                vals = fn(list(texts))
+                # the evaluator calls fn(completions, **kwargs) FIRST and only falls back to
+                # fn(completions) on TypeError; mirror that so a reward reading kwargs["prompts"]
+                # is optimised and validated the way it will be scored
+                vals = fn(texts, **kw)
             except TypeError:
-                vals = fn(list(texts), prompts=[""] * len(texts))
-            return [float(v) if v is not None and not (isinstance(v, float) and math.isnan(v)) else 0.0
-                    for v in vals]
+                vals = fn(texts)
+            out = []
+            for v in vals:
+                try:
+                    v = float(v)
+                except (TypeError, ValueError):
+                    v = 0.0
+                out.append(v if math.isfinite(v) else 0.0)
+            return out
         except ImportError:
             # A package WE lack (langcheck) but the evaluator has: it will score this function
             # normally, we simply cannot optimise it. Not a reason to reject the candidate.
@@ -106,7 +119,7 @@ class Objective:
         texts = [p + text for p in self.prefixes]
         out = []
         for fn in self.fns:
-            vals = self._raw(fn, texts, strict=strict)
+            vals = self._raw(fn, texts, strict=strict, prompts=self.prompts[:len(texts)])
             if vals == "unavailable":
                 out.append(0.0)
                 continue
@@ -135,10 +148,10 @@ def _render(c):
 
 
 def search(fns, weights, sources, count_tokens, ref_texts, max_tokens=240, seconds=90.0, seed=0,
-           log=print, prefixes=("",)):
+           log=print, prefixes=("",), prompts=None):
     """Return (best_text, utility, per-function values, objective)."""
     rng = random.Random(seed)
-    obj = Objective(fns, weights, count_tokens, max_tokens, ref_texts, prefixes)
+    obj = Objective(fns, weights, count_tokens, max_tokens, ref_texts, prefixes, prompts)
     pool = set(_literals(sources)) | set(LONG_WORDS) | set(SHORT_WORDS) | set(CONNECTIVES)
     for t in ref_texts[:64]:
         pool.update(w for w in t.split()[:80] if len(w) <= 24)

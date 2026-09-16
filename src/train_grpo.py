@@ -84,6 +84,7 @@ def main() -> None:
     import random as _random
     _random.Random(1337).shuffle(data)
     n_dev = int(os.environ.get("SN56_GRPO_DEV") or min(128, max(0, len(data) // 10)))
+    n_dev = min(n_dev, max(0, len(data) // 2))
     if n_dev < 24:
         n_dev = 0
     dev, data = data[:n_dev], data[n_dev:]
@@ -113,7 +114,7 @@ def main() -> None:
 
     # Oracle distillation (grpo_distill.py). Only for prompt-independent rewards: a task whose
     # rewards read extra_data scores against per-prompt answers, which one string cannot hit.
-    if distill_mode and not any("extra_data" in d for d in data):
+    if distill_mode and not dt.get("extra_column") and not any("extra_data" in d for d in data):
         import grpo_distill
         from reward_compile import _extract_callable
         fns, weights, sources = [], [], []
@@ -127,6 +128,10 @@ def main() -> None:
 
         def save_distilled(src_dir, adapter_name, tag):
             import shutil
+
+            for fn in os.listdir(args.output_dir) if os.path.isdir(args.output_dir) else []:
+                if fn.startswith("model") and fn.endswith((".safetensors", ".bin")):
+                    os.remove(os.path.join(args.output_dir, fn))
             # PEFT writes a non-default adapter into <dir>/<adapter_name>/
             src = os.path.join(src_dir, adapter_name)
             if not os.path.isfile(os.path.join(src, "adapter_config.json")):

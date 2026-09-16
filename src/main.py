@@ -120,6 +120,9 @@ def main() -> None:
               "--state-file", paths.STATE_FILE]
 
     repair = {"report": None}  # augment_repair outcome, decided once per task
+    # Set when no further attempt can possibly work (the only stack that could load this model is
+    # unavailable). Retrying then just burns the budget the emergency submission needs.
+    hopeless = {"stop": False}
 
     def attempts() -> bool:
         # keep enough tail for a save: 15 min on long tasks, proportionally less on short ones
@@ -143,6 +146,10 @@ def main() -> None:
             rc = one_attempt(attempt)
             if rc == 0 and submission_ok(out_dir):
                 return True
+            if hopeless["stop"]:
+                print("[main] no stack can train this model; going straight to the fallback",
+                      flush=True)
+                break
             if os.path.isdir(keep) and not submission_ok(out_dir):
                 try:
                     import shutil
@@ -169,6 +176,12 @@ def main() -> None:
                           "instruct" if args.task_type == "InstructTextTask" else "chat"],
                          end_ts)
                 if rc != 42:
+                    return rc
+                if plan_mod.needs_modern_stack(info):
+                    # the legacy stack cannot load this architecture at all
+                    hopeless["stop"] = True
+                    print("[main] modern stack unavailable and the legacy one cannot load this arch",
+                          flush=True)
                     return rc
                 print("[main] modern stack unavailable (rc=42); legacy fallback", flush=True)
             if not os.path.isdir(os.path.join(tok_dir, "train")):
@@ -245,6 +258,13 @@ def main() -> None:
                 sft_env["SN56_ADAPTER_PREF"] = os.environ.get("SN56_ADAPTER_PREF", "lora")
             return run([sys.executable, os.path.join(SRC, "train_sft.py"),
                         *common, "--tokenized-dir", tok_dir], end_ts, sft_env)
+
+        if args.task_type in ("DpoTask", "GrpoTask", "EnvTask") and plan_mod.needs_modern_stack(info):
+            # these trainers only exist on the legacy stack (trl), which cannot load this arch
+            hopeless["stop"] = True
+            print(f"[main] {args.task_type} on an arch the legacy stack cannot load; fallback only",
+                  flush=True)
+            return 3
 
         if args.task_type == "DpoTask":
             return run([sys.executable, os.path.join(SRC, "train_dpo.py"),

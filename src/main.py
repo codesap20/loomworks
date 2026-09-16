@@ -175,6 +175,16 @@ def main() -> None:
             # the schedule/LR differences vanish once both sides converge. In particular
             # the old chat default of lr x0.85 is WORSE at the real budget than x1.0.
             sft_env = {"SN56_USE_SOUP": os.environ.get("SN56_USE_SOUP", "1")}
+            # Heavy magnitude pruning (validator augmentation, exact-zero fraction) leaves dense
+            # zeroed matrices a rank-64 adapter cannot refill. Measured 2026-09-15 (Qwen3-0.6B chat,
+            # 50% pruned, per-sample CE after full training): LoRA r64 1.5673 vs r256 1.5225 and
+            # full-ft 1.5225 — r256 wins 688-29 of decided samples and matches full-ft. At 30%
+            # pruning every regime lands within 0.005, so only the heavy case gets the bigger rank.
+            _pruned = (repair["report"] or {}).get("pruned_frac", 0.0)
+            if _pruned >= 0.35 and (info["params"] or 0) <= 14e9 and "SN56_LORA_R" not in os.environ:
+                sft_env["SN56_LORA_R"] = "256"
+                print(f"[main] {_pruned:.0%} of weights pruned -> LoRA rank 256 if an adapter is used",
+                      flush=True)
             if args.task_type == "ChatTask":
                 sft_env["SN56_CHAMP_SCHED"] = os.environ.get("SN56_CHAMP_SCHED", "1")
                 sft_env["SN56_LR_MULT"] = os.environ.get("SN56_LR_MULT", "1.0")

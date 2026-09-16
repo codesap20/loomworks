@@ -129,9 +129,30 @@ def main() -> None:
                 print(f"[main] <{retry_guard / 60:.0f}min left before attempt {attempt}; "
                       "stopping retries", flush=True)
                 break
+            keep = out_dir.rstrip("/") + ".keep"
+            if attempt > 1 and submission_ok(out_dir):
+                # attempt N-1 left something valid: hold a copy, because a retry that crashes late
+                # (or runs on a fraction of the budget) can otherwise overwrite it with worse weights
+                try:
+                    import shutil
+
+                    shutil.rmtree(keep, ignore_errors=True)
+                    shutil.copytree(out_dir, keep)
+                except Exception as e:
+                    print(f"[main] could not stash the previous submission: {e}", flush=True)
             rc = one_attempt(attempt)
             if rc == 0 and submission_ok(out_dir):
                 return True
+            if os.path.isdir(keep) and not submission_ok(out_dir):
+                try:
+                    import shutil
+
+                    shutil.rmtree(out_dir, ignore_errors=True)
+                    shutil.move(keep, out_dir)
+                    print("[main] restored the previous attempt's submission", flush=True)
+                    return True
+                except Exception as e:
+                    print(f"[main] could not restore the stashed submission: {e}", flush=True)
             print(f"[main] attempt {attempt} rc={rc}", flush=True)
         return submission_ok(out_dir)
 

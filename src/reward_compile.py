@@ -9,9 +9,63 @@ never take the training run down, so every call is fenced.
 import math
 
 
+class _MissingCall:
+    """Attribute of a stubbed module. Raises ImportError when used, which the oracle already reads as
+    'the evaluator can score this, we cannot optimise it'."""
+
+    def __init__(self, name: str):
+        self._name = name
+
+    def __getattr__(self, attr):
+        return _MissingCall(f"{self._name}.{attr}")
+
+    def __call__(self, *a, **k):
+        raise ImportError(f"{self._name} is not installed here (the evaluator has it)")
+
+
+class _MissingModule:
+    """Stands in for a package only the evaluator has (langcheck), so a module-scope import does not
+    delete the whole function from our objective.
+
+    Deliberately NOT callable: the evaluator picks the first callable in the namespace
+    (rewards/functions.py validate_reward_function), and a callable stub would be picked instead of
+    the reward function itself.
+    """
+
+    def __init__(self, name: str):
+        self._name = name
+
+    def __getattr__(self, attr):
+        return _MissingCall(f"{self._name}.{attr}")
+
+
+def _exec_with_stubs(source: str, namespace: dict) -> None:
+    """exec the reward source, stubbing out any import WE lack (the evaluator has them)."""
+    import builtins
+
+    real_import = builtins.__import__
+    missing: list[str] = []
+
+    def guarded(name, *a, **k):
+        try:
+            return real_import(name, *a, **k)
+        except ImportError:
+            missing.append(name)
+            return _MissingModule(name)
+
+    builtins.__import__ = guarded
+    try:
+        exec(source, namespace)
+    finally:
+        builtins.__import__ = real_import
+    if missing:
+        print(f"[rewards] stubbed missing imports {sorted(set(missing))}: the evaluator scores this "
+              "function for real, we just cannot optimise it", flush=True)
+
+
 def _extract_callable(source: str):
     namespace: dict = {}
-    exec(source, namespace)  # trusted input: the validator authored/vetted it
+    _exec_with_stubs(source, namespace)  # trusted input: the validator authored/vetted it
     # Pick EXACTLY what the evaluator scores: validator/tasks/rewards/functions.py
     # validate_reward_function takes next(v for k, v in namespace.items() if callable(v)),
     # i.e. the first callable in definition order (helpers and from-imports included).

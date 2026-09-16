@@ -3,10 +3,12 @@
 import json
 import os
 
-CACHE_ROOT = "/cache"
-CHECKPOINTS_ROOT = "/app/checkpoints"
-WORK_ROOT = "/workspace/run"
-STATE_FILE = "/tmp/trainer_state.json"
+# Container paths. The env overrides exist so local harnesses can run several tasks side by side in
+# ONE filesystem; the validator sets none of them, so production keeps the fixed container layout.
+CACHE_ROOT = os.environ.get("SN56_CACHE_ROOT", "/cache")
+CHECKPOINTS_ROOT = os.environ.get("SN56_CHECKPOINTS_ROOT", "/app/checkpoints")
+WORK_ROOT = os.environ.get("SN56_WORK_ROOT", "/workspace/run")
+STATE_FILE = os.environ.get("SN56_STATE_FILE", "/tmp/trainer_state.json")
 
 
 def model_cache_path(model_id: str) -> str:

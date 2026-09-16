@@ -347,6 +347,19 @@ def main() -> None:
 
     # ---- trainer ----------------------------------------------------------- #
     class KlTrainer(Trainer):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            # THE 2026-09-14 QUALITY BUG. For models whose forward accepts loss kwargs (Qwen, Llama,
+            # ...) transformers' training_step skips `loss / gradient_accumulation_steps`, expecting
+            # compute_loss to forward num_items_in_batch so the model returns a sum normalised over
+            # the whole accumulation window. Our compute_loss (here and in SftTrainer) calls
+            # model(**inputs) without it and returns a per-micro-batch MEAN, so every update was
+            # grad_accum times too large: the live 0.5B round-1 task logged train loss 16-26 against
+            # an eval loss of 1.3-2.7 (grad norm 40-600), the model got WORSE than its base early on
+            # (2.68 vs 2.06), and we finished 15th of 16. Declaring the flag False restores the
+            # division. (TRL's DPO/GRPO trainers already do exactly this.)
+            self.model_accepts_loss_kwargs = False
+
         def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
             outputs = model(**inputs)
             loss = outputs.loss

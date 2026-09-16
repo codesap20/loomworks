@@ -967,6 +967,35 @@ def main() -> None:
     if best["saved_at"] == 0.0 and not os.path.isdir(args.output_dir):
         export(trainer, "fallback-final")
 
+    # Champion-style final pass over the held-out dev rows (its dev_pass.py: 1 epoch at 0.25x LR).
+    # Those rows are real training data we never fit, but spending them ends selection: after this
+    # there is no clean held-out set, so it ships blind. DEFAULT OFF until measured.
+    if (os.environ.get("SN56_DEV_PASS") == "1" and len(dev_ds) >= 16
+            and time.time() < args.end_ts - save_margin):
+        try:
+            from torch.utils.data import DataLoader
+            dp_lr = peak_lr * float(os.environ.get("SN56_DEV_PASS_LR_MULT") or 0.25)
+            loader = DataLoader(dev_ds.remove_columns(
+                [c for c in dev_ds.column_names if c not in ("input_ids", "labels", "attention_mask")]),
+                batch_size=micro_bs, shuffle=True, collate_fn=pad_collator)
+            opt = torch.optim.AdamW([p_ for p_ in trainer.model.parameters() if p_.requires_grad], lr=dp_lr)
+            trainer.model.train()
+            n = 0
+            for batch in loader:
+                if time.time() > args.end_ts - save_margin:
+                    break
+                batch = {k: v.to(trainer.model.device) for k, v in batch.items()}
+                loss = trainer.model(**batch).loss
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), 1.0)
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+                n += 1
+            log(f"dev_pass: {n} steps at lr {dp_lr:.2e} over {len(dev_ds)} held-out rows")
+            export(trainer, "dev_pass")
+        except Exception as e:
+            log(f"dev_pass failed ({type(e).__name__}: {e}); keeping the selected checkpoint")
+
     if is_main:
         with open(os.path.join(os.path.dirname(args.output_dir), "success.txt"), "w") as f:
             f.write(f"{picked} {best['loss']}\n")

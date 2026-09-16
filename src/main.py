@@ -47,6 +47,11 @@ def run(cmd: list[str], deadline: float, env_extra: dict | None = None) -> int:
     except subprocess.TimeoutExpired:
         print("[main] attempt hit the wall clock", flush=True)
         return 124
+    except OSError as e:
+        # e.g. the interpreter itself is missing. Raising here would escape attempts() and skip the
+        # emergency submission entirely, turning a recoverable problem into a forfeited task.
+        print(f"[main] could not start {cmd[0]}: {e}", flush=True)
+        return 127
 
 
 def submission_ok(out_dir: str) -> bool:
@@ -63,10 +68,22 @@ def emergency_submission(model_path: str, out_dir: str, modern: bool) -> None:
     A zero-risk placeholder is worth more than an empty upload. Custom v5-only
     architectures must be loaded by the modern venv's interpreter."""
     print("[main] EMERGENCY: submitting jittered base model", flush=True)
-    py = MODERN_PY if modern else sys.executable
-    subprocess.run([py, os.path.join(SRC, "emergency.py"),
-                    "--model-path", model_path, "--output-dir", out_dir],
-                   check=True, timeout=1800)
+    # try the stack that can load this arch first, then the other one: emergency.py falls back to a
+    # raw checkpoint copy that needs neither, so whichever interpreter exists can finish the job.
+    order = [MODERN_PY, sys.executable] if modern else [sys.executable, MODERN_PY]
+    last = None
+    for py in order:
+        if not os.path.isfile(py):
+            continue
+        try:
+            subprocess.run([py, os.path.join(SRC, "emergency.py"),
+                            "--model-path", model_path, "--output-dir", out_dir],
+                           check=True, timeout=1800)
+            return
+        except Exception as e:
+            last = e
+            print(f"[main] emergency via {py} failed: {e}", flush=True)
+    raise RuntimeError(f"no interpreter could write an emergency submission ({last})")
 
 
 def main() -> None:
@@ -219,7 +236,16 @@ def main() -> None:
         print(f"[main] unknown task type {args.task_type}", flush=True)
         return 2
 
-    ok = attempts()
+    try:
+        ok = attempts()
+    except Exception as e:
+        # Never let an unexpected exception reach the top level: an empty upload loses the task
+        # outright, while the emergency submission below is always worth more than nothing.
+        import traceback
+
+        traceback.print_exc()
+        print(f"[main] attempts() raised {type(e).__name__}: {e}", flush=True)
+        ok = False
     rep = repair["report"] or {}
     if ok and rep.get("scaled") and os.path.isfile(os.path.join(out_dir, "adapter_config.json")):
         # an adapter would be loaded onto the damaged base by the validator; ship merged weights

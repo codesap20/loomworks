@@ -141,12 +141,14 @@ def run(model, tok, train_prompts, dev_prompts, fns, weights, sources, end_ts, s
     robust, u_r, _, _ = grpo_oracle.search(fns, weights, sources, count, refs, seconds=search_s / 2, log=say,
                                            prefixes=prefixes, prompts=train_prompts[:8])
     alpha0 = float(os.environ.get("SN56_DISTILL_ALPHA") or 0.3)
-    # Three candidates, in priority order. Once every reward function is won on rank, the score is
-    # decided purely by 0.5 * prompt-KL, so a KL-tightened variant of the anchored string is worth
-    # training whenever the budget allows: same text, heavier leash on the interior prompt positions.
+    # Three candidates, in priority order. Once every reward function is won on rank the score is
+    # decided purely by 0.5 * prompt-KL, and that KL is dominated by the LAST prompt position (the
+    # forced first completion token), not the interior — measured on alpaca: alpha .3 -> KL .109,
+    # alpha .6 -> .051, while a 4x interior leash only moved .109 -> .096. So the third candidate
+    # softens alpha rather than the interior weight; alpha .6 also beat .3 head to head (.786/.757).
     cands = [("anchored", anchored, alpha0, lam),
              ("robust", robust, 1.0, lam),
-             ("anchored_lowkl", anchored, alpha0, lam * float(os.environ.get("SN56_DISTILL_LAM_MULT") or 4.0))]
+             ("anchored_mid", anchored, float(os.environ.get("SN56_DISTILL_ALPHA_MID") or 0.6), lam)]
     if anchored == robust:
         cands = [cands[0], cands[2]]
 

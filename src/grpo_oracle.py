@@ -68,6 +68,9 @@ class Objective:
         self.prefixes = list(prefixes) or [""]
         self.count_tokens, self.max_tokens = count_tokens, max_tokens
         cols = [self._raw(fn, ref_texts) for fn in fns]
+        # functions we cannot run locally contribute nothing to the search (constant column)
+        self.unavailable = [i for i, c in enumerate(cols) if c == "unavailable"]
+        cols = [[0.0] * len(ref_texts) if c == "unavailable" else c for c in cols]
         self.mu = [sum(c) / len(c) for c in cols]
         self.sd = []
         for c, m in zip(cols, self.mu):
@@ -92,6 +95,10 @@ class Objective:
                 vals = fn(list(texts), prompts=[""] * len(texts))
             return [float(v) if v is not None and not (isinstance(v, float) and math.isnan(v)) else 0.0
                     for v in vals]
+        except ImportError:
+            # A package WE lack (langcheck) but the evaluator has: it will score this function
+            # normally, we simply cannot optimise it. Not a reason to reject the candidate.
+            return "unavailable"
         except Exception:
             return None if strict else [0.0] * len(texts)
 
@@ -100,6 +107,9 @@ class Objective:
         out = []
         for fn in self.fns:
             vals = self._raw(fn, texts, strict=strict)
+            if vals == "unavailable":
+                out.append(0.0)
+                continue
             if vals is None:
                 return None
             out.append(sum(vals) / len(texts))

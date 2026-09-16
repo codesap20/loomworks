@@ -61,7 +61,8 @@ def _reward_safe(fns, texts):
     """
     for fn in fns:
         for i in range(0, len(texts), 16):
-            if grpo_oracle.Objective._raw(fn, texts[i:i + 16], strict=True) is None:
+            r = grpo_oracle.Objective._raw(fn, texts[i:i + 16], strict=True)
+            if r is None:   # "unavailable" = a package only the evaluator has; that is fine
                 return False
     return True
 

@@ -27,8 +27,12 @@ JITTER = 1e-2  # must exceed bf16 relative resolution (~0.0078) or the write is 
 def _via_transformers(model_path: str, out_dir: str) -> None:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=torch.bfloat16, trust_remote_code=True)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, dtype=torch.bfloat16, trust_remote_code=True)
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, torch_dtype=torch.bfloat16, trust_remote_code=True)
     emb = model.get_input_embeddings().weight
     with torch.no_grad():
         emb.mul_(1.0 + torch.randn_like(emb) * JITTER)
@@ -134,6 +138,9 @@ def main() -> None:
     if os.path.isdir(args.model_path) and args.model_path not in sys.path:
         sys.path.insert(0, args.model_path)  # flat sibling imports in custom archs
 
+    for stale in os.listdir(args.output_dir) if os.path.isdir(args.output_dir) else []:
+        if stale.startswith("adapter_"):
+            os.remove(os.path.join(args.output_dir, stale))
     try:
         _via_transformers(args.model_path, args.output_dir)
         print("emergency submission written (transformers)")

@@ -168,7 +168,9 @@ def main() -> None:
             # (the validator never augments bases >= 35B, so skip reading their weights)
             if (os.environ.get("SN56_AUG_REPAIR", "1") == "1" and os.environ.get("USE_KL") != "1"
                     and (info["params"] or 0) <= 30e9 and repair["report"] is None):
-                rep_path = os.path.join(paths.WORK_ROOT, "augment_report.json")
+                rep_path = os.path.join(paths.WORK_ROOT, f"augment_report_{args.task_id}.json")
+                if os.path.isfile(rep_path):
+                    os.remove(rep_path)
                 run([sys.executable, os.path.join(SRC, "augment_repair.py"), "repair",
                      "--model-path", model_path, "--work-root", paths.WORK_ROOT,
                      "--tok-dir", tok_dir, "--report", rep_path],

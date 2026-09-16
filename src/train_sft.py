@@ -970,8 +970,10 @@ def main() -> None:
     # Champion-style final pass over the held-out dev rows (its dev_pass.py: 1 epoch at 0.25x LR).
     # Those rows are real training data we never fit, but spending them ends selection: after this
     # there is no clean held-out set, so it ships blind. DEFAULT OFF until measured.
+    # its own deadline: save_margin is what STOPS training, so reusing it here would leave no time
+    dp_deadline = args.end_ts - max(60, save_margin // 3)
     if (os.environ.get("SN56_DEV_PASS") == "1" and len(dev_ds) >= 16
-            and time.time() < args.end_ts - save_margin):
+            and time.time() < dp_deadline):
         try:
             from torch.utils.data import DataLoader
             dp_lr = peak_lr * float(os.environ.get("SN56_DEV_PASS_LR_MULT") or 0.25)
@@ -982,7 +984,7 @@ def main() -> None:
             trainer.model.train()
             n = 0
             for batch in loader:
-                if time.time() > args.end_ts - save_margin:
+                if time.time() > dp_deadline:
                     break
                 batch = {k: v.to(trainer.model.device) for k, v in batch.items()}
                 loss = trainer.model(**batch).loss

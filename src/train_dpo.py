@@ -229,7 +229,7 @@ def main() -> None:
         save_strategy="no",
         logging_steps=20,
         report_to=[],
-        seed=1337,
+        seed=int(os.environ.get("SN56_SEED") or 1337),
         remove_unused_columns=False,
     )
 

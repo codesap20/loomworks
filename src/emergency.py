@@ -47,8 +47,28 @@ def _embedding_key(keys: list[str]) -> str | None:
     return None
 
 
+def _jitter(t: torch.Tensor) -> torch.Tensor:
+    gen = torch.Generator().manual_seed(1337)
+    noise = torch.randn(t.shape, generator=gen, dtype=torch.float32) * JITTER
+    return (t.float() * (1.0 + noise)).to(t.dtype)
+
+
+def _pick_key(keys: list[str], shapes: dict) -> str | None:
+    """The embedding tensor by name, else the largest 2-D float tensor (any arch, any naming)."""
+    key = _embedding_key(keys)
+    if key is not None:
+        return key
+    two_d = [(shapes[k][0] * shapes[k][1], k) for k in keys if len(shapes.get(k, ())) == 2]
+    return max(two_d)[1] if two_d else (keys[0] if keys else None)
+
+
 def _raw_copy(model_path: str, out_dir: str) -> None:
-    """Copy the checkpoint and jitter one embedding tensor without ever building the model."""
+    """Copy the checkpoint and jitter one tensor without ever building the model.
+
+    Handles safetensors AND .bin checkpoints: plenty of models in the 0.1-12B pool ship only
+    pytorch_model*.bin, and requiring safetensors here would leave a byte-identical copy of the base
+    (which fails the validator's is-finetune check) on exactly the tasks this fallback exists for.
+    """
     from safetensors import safe_open
     from safetensors.torch import save_file
 
@@ -59,24 +79,50 @@ def _raw_copy(model_path: str, out_dir: str) -> None:
             shutil.copy2(src, os.path.join(out_dir, name))
 
     shards = sorted(glob.glob(os.path.join(out_dir, "*.safetensors")))
-    if not shards:
-        raise RuntimeError("no safetensors shards to jitter")
     for shard in shards:
         with safe_open(shard, framework="pt") as f:
             keys = list(f.keys())
             meta = f.metadata()
-            key = _embedding_key(keys)
+            shapes = {k: tuple(f.get_slice(k).get_shape()) for k in keys}
+            key = _pick_key(keys, shapes) if _embedding_key(keys) else None
             if key is None:
                 continue
             tensors = {k: f.get_tensor(k) for k in keys}
-        t = tensors[key]
-        gen = torch.Generator().manual_seed(1337)
-        noise = torch.randn(t.shape, generator=gen, dtype=torch.float32) * JITTER
-        tensors[key] = (t.float() * (1.0 + noise)).to(t.dtype)
+        tensors[key] = _jitter(tensors[key])
         save_file(tensors, shard, metadata=meta or {"format": "pt"})
         print(f"emergency: jittered {key} in {os.path.basename(shard)}", flush=True)
         return
-    raise RuntimeError("no embedding tensor found in any shard")
+
+    bins = sorted(glob.glob(os.path.join(out_dir, "*.bin")) + glob.glob(os.path.join(out_dir, "*.pt")))
+    for shard in bins:
+        sd = torch.load(shard, map_location="cpu", weights_only=True)
+        if not isinstance(sd, dict) or not sd:
+            continue
+        shapes = {k: tuple(v.shape) for k, v in sd.items() if hasattr(v, "shape")}
+        key = _pick_key(list(sd), shapes)
+        if key is None or not hasattr(sd.get(key), "shape"):
+            continue
+        sd[key] = _jitter(sd[key])
+        torch.save(sd, shard)
+        print(f"emergency: jittered {key} in {os.path.basename(shard)}", flush=True)
+        return
+
+    # last resort: any shard at all, largest 2-D tensor (a single-shard model whose embedding name
+    # matched nothing above)
+    for shard in shards:
+        with safe_open(shard, framework="pt") as f:
+            keys = list(f.keys())
+            meta = f.metadata()
+            shapes = {k: tuple(f.get_slice(k).get_shape()) for k in keys}
+            tensors = {k: f.get_tensor(k) for k in keys}
+        key = _pick_key(keys, shapes)
+        if key is None:
+            continue
+        tensors[key] = _jitter(tensors[key])
+        save_file(tensors, shard, metadata=meta or {"format": "pt"})
+        print(f"emergency: jittered {key} (fallback pick) in {os.path.basename(shard)}", flush=True)
+        return
+    raise RuntimeError("no weight shard could be jittered")
 
 
 def main() -> None:

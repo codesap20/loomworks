@@ -81,22 +81,47 @@ def write_state(path, payload):
         pass
 
 
-def check_modern_stack():
-    """Exit 42 if the modern stack is unusable so main.py can fall back."""
+def check_modern_stack(model_path: str | None = None):
+    """Exit 42 if the modern stack is unusable so main.py can fall back.
+
+    fla / causal_conv1d are hard requirements ONLY for the quasar remote-code archs that import them.
+    For everything else routed here — any model_type the legacy transformers does not know, e.g.
+    lfm2 — falling back would hand the model to a stack that provably cannot load it (that is how the
+    2026-09-14 round was lost), so those two are optional and their absence must not trigger 42.
+    """
     import importlib
-    for module in ("torch", "transformers", "accelerate", "fla", "causal_conv1d"):
+    import json as _json
+
+    needs_fla = True
+    if model_path:
+        try:
+            with open(os.path.join(model_path, "config.json")) as f:
+                cfg = _json.load(f)
+            mt = (cfg.get("model_type") or "").lower()
+            needs_fla = mt.startswith("quasar") or "auto_map" in cfg
+        except Exception:
+            needs_fla = False
+    required = ["torch", "transformers", "accelerate"] + (["fla", "causal_conv1d"] if needs_fla else [])
+    for module in required:
         try:
             importlib.import_module(module)
         except Exception as exc:  # noqa: BLE001 - any import failure means fallback
             print(f"[launcher] modern stack import failed ({module}): {exc}", flush=True)
             sys.exit(EXIT_MODERN_UNAVAILABLE)
+    for optional in ("fla", "causal_conv1d"):
+        if optional not in required:
+            try:
+                importlib.import_module(optional)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[launcher] {optional} unavailable ({exc}); continuing (not needed by this arch)",
+                      flush=True)
     if not ACCEL_CONFIG.is_file():
         print(f"[launcher] missing accelerate config {ACCEL_CONFIG}", flush=True)
         sys.exit(EXIT_MODERN_UNAVAILABLE)
 
 
 def relaunch_under_accelerate(args):
-    check_modern_stack()
+    check_modern_stack(getattr(args, "model_path", None) or getattr(args, "model", None))
     env = dict(os.environ)
     env[WORKER_ENV] = "1"
     env.setdefault("TOKENIZERS_PARALLELISM", "false")

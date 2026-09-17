@@ -224,6 +224,9 @@ def main() -> None:
     grad_accum = max(1, round(target_effective / (micro_bs * world)))
 
     steps_per_epoch = max(1, math.ceil(len(train_ds) / (micro_bs * world * grad_accum)))
+    log(f"plan: micro={micro_bs} accum={grad_accum} eff={micro_bs * world * grad_accum} "
+        f"steps/epoch={steps_per_epoch} lr={peak_lr:.2e} packing={packing} lora={bool(lora)} "
+        f"seq_len={seq_len}")
 
     from transformers import DataCollatorForSeq2Seq
     _MODEL_KEYS = ("input_ids", "attention_mask", "labels")
@@ -347,6 +350,17 @@ def main() -> None:
 
     # ---- trainer ----------------------------------------------------------- #
     class KlTrainer(Trainer):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            # SN56_LOSS_NORM=fix: transformers skips loss/grad_accum for models whose forward accepts
+            # loss kwargs, expecting compute_loss to pass num_items_in_batch; ours does not, so the
+            # update is grad_accum x too large (clipping then makes every step a max-norm step).
+            # Default OFF: on chat at micro_batch 1 the "correct" version LOST 20-620 (1.3419 vs
+            # 1.3175), so this must be measured per task alongside LR, not flipped blind.
+            if os.environ.get("SN56_LOSS_NORM") == "fix":
+                self.model_accepts_loss_kwargs = False
+                log("loss normalisation: dividing by grad_accum (SN56_LOSS_NORM=fix)")
+
         def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
             outputs = model(**inputs)
             loss = outputs.loss

@@ -220,7 +220,10 @@ def main() -> None:
     if packing:
         micro_bs = max(1, micro_bs // 2)  # flattened rows are mb x len long
     world = max(1, args.num_gpus)
-    target_effective = 64
+    # Tokens per update, not sequences, is what the field's recipes maximise: rank 4 on the live
+    # 0.5B task ran batch 60 of PACKED 2031-token sequences (~120k tokens/update) against our 65
+    # short sequences (~26k). Fewer, cleaner updates also delay the overfitting our dev curve shows.
+    target_effective = int(os.environ.get("SN56_EFF_BATCH") or 64)
     grad_accum = max(1, round(target_effective / (micro_bs * world)))
 
     steps_per_epoch = max(1, math.ceil(len(train_ds) / (micro_bs * world * grad_accum)))

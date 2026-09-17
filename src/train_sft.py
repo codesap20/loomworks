@@ -72,7 +72,8 @@ class WsdPlan:
         self.warmup = max(1, warmup_steps)
         self.decay_start: int | None = None
         self.decay_len: int = 1
-        self.floor = 0.10  # winners cool to ~0.25*peak; WSD's flat phase lets us floor lower
+        # winners cool to ~0.25*peak; WSD's flat phase lets us floor lower. SN56_WSD_FLOOR to A/B.
+        self.floor = float(os.environ.get("SN56_WSD_FLOOR") or 0.10)
 
     def factor(self, step: int) -> float:
         if step < self.warmup:

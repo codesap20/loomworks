@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 
+import config_compat
 import paths
 import plan as plan_mod
 
@@ -104,6 +105,21 @@ def main() -> None:
     out_dir = paths.submission_dir(args.task_id, args.expected_repo_name)
     tok_dir = paths.tokenized_dir(args.task_id)
     os.makedirs(paths.WORK_ROOT, exist_ok=True)
+
+    # A base saved by transformers 5 keeps its RoPE in a "rope_parameters" block that our 4.x
+    # trainer does not know, so it trains at the class-default theta (10000) while the validator
+    # scores the upload at the real one. Measured on live task 067761fe (Llama-3.2-1B): the
+    # misread base scores 3.31 on the task's own test set vs 2.45 read correctly, and we finished
+    # 13/16. Normalise before probe_model or any trainer reads the config. Both stacks accept the
+    # 4.x schema (transformers 5 converts it back on load), so this is safe for either path.
+    try:
+        config_compat.normalize(model_path, log=lambda m: print(f"[main] {m}", flush=True))
+    except Exception as exc:                                    # never fatal: a config we cannot
+        print(f"[main] config_compat skipped: {exc}", flush=True)   # parse is left untouched
+    try:
+        config_compat.normalize_tokenizer(model_path, log=lambda m: print(f"[main] {m}", flush=True))
+    except Exception as exc:
+        print(f"[main] tokenizer compat skipped: {exc}", flush=True)
 
     info = plan_mod.probe_model(model_path)
     n_gpus, _ = plan_mod.gpu_inventory()
@@ -340,6 +356,16 @@ def main() -> None:
             emergency_submission(fallback_src, out_dir, plan_mod.needs_modern_stack(info))
         except Exception as e:
             print(f"[main] emergency submission failed too: {e}", flush=True)
+    # Defence in depth: whatever produced the upload (trainer, merge, emergency copy), make sure
+    # the config we ship says the same thing about RoPE as the one we trained with. Our live
+    # 067761fe upload carried rope_theta 10000 AND a 5.x block saying 500000, so the validator
+    # scored it under a different positional encoding than the one it was trained on.
+    try:
+        config_compat.normalize(out_dir, log=lambda m: print(f"[main] out {m}", flush=True))
+        config_compat.normalize_tokenizer(out_dir, log=lambda m: print(f"[main] out {m}", flush=True))
+    except Exception as exc:
+        print(f"[main] output config_compat skipped: {exc}", flush=True)
+
     print(f"[main] finished ok={ok or submission_ok(out_dir)} "
           f"elapsed={(time.time() - start) / 60:.0f}m", flush=True)
 

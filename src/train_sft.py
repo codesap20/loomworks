@@ -460,6 +460,11 @@ def main() -> None:
         # bf16 CPU snapshots of every trainable: 4 of them for a 7B full-ft is ~55 GiB of host RAM
         # on top of ema/raw/fp32 copies, and a host OOM kill loses the task outright.
         soup_k = 4 if (info["params"] or 0) <= 3e9 else 2 if (info["params"] or 0) <= 8e9 else 1
+    # sweep-only: a bigger pool is allowed for small models; the RAM guard above still
+    # caps anything over 3B, where 4 bf16 snapshots already risk a host OOM kill.
+    _k_env = int(os.environ.get("SN56_SOUP_K") or 0)
+    if _k_env:
+        soup_k = _k_env if (info["params"] or 0) <= 3e9 else min(_k_env, soup_k)
     # greedy = test each candidate against dev and keep it if dev improves (k selection
     # passes); uniform = average the pool once and read dev once (1 pass). See the soup
     # block for the measurement that motivates having the choice.
@@ -468,6 +473,8 @@ def main() -> None:
     # density, 3 stale evals is half as much training as before, so scale it.
     evals_per_run = int(os.environ.get("SN56_EVALS_PER_RUN") or 12)
     stale_patience = max(3, round(3 * evals_per_run / 12))
+    # sweep-only: raise to let a cool-LR run keep training past the first dev bump
+    stale_patience = int(os.environ.get("SN56_STALE_PATIENCE") or stale_patience)
     # the floor scales with density so the default (12) keeps its old value of 12
     # and a denser setting is not silently clamped back to it
     eval_floor = max(2, round(144 / max(1, evals_per_run)))

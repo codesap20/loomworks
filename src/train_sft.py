@@ -354,6 +354,8 @@ def main() -> None:
     # test-only: lets a short local run exercise the end-of-run soup/select path
     # (zero3's 900s margin would otherwise need a >30min budget). Never set in prod.
     save_margin = int(os.environ.get("SN56_SAVE_MARGIN") or save_margin)
+    # measured during the run: seconds per dev eval and per export (trainer.save_model)
+    timing = {"eval_s": None, "export_s": None}
 
     wsd = WsdPlan(warmup_steps=max(4, int(0.02 * steps_per_epoch * 2)))
     planned = {"total": steps_per_epoch * epoch_cap}
@@ -549,7 +551,9 @@ def main() -> None:
         if regime["dist"] != "zero3" and not is_main:
             return
         os.makedirs(args.output_dir, exist_ok=True)
+        _t_exp = time.time()
         trainer.save_model(args.output_dir)
+        timing["export_s"] = max(timing["export_s"] or 0.0, time.time() - _t_exp)
         if is_main:
             tokenizer.save_pretrained(args.output_dir)
             _patch_architectures(args.output_dir, info["architectures"])
@@ -597,6 +601,29 @@ def main() -> None:
                 # final selection re-uses trainer.evaluate(); those readings must not
                 # pool/slot/export/early-stop — the final block exports the winner itself
                 return
+            _rt = (metrics or {}).get("eval_runtime")
+            if _rt:
+                timing["eval_s"] = max(timing["eval_s"] or 0.0, float(_rt))
+            # The step-13 plan only knows seconds per TRAINING step. At 24 evals/run the evals
+            # themselves are minutes, so a clock-bound run would train into save_margin — and the
+            # final soup/EMA pass then had no budget and was skipped (live LFM2.5 e2e, 2026-09-19:
+            # "final: best_ondisk raw -> pick raw"). Trim the plan so the remaining evals fit.
+            if self.t_per_step and timing["eval_s"] and planned["total"]:
+                step = tstate.global_step
+                every = max(1, targs.eval_steps or 1)
+                steps_left = max(0, planned["total"] - step)
+                evals_left = steps_left // every + 1
+                avail = args.end_ts - save_margin - time.time()
+                need = steps_left * self.t_per_step + evals_left * timing["eval_s"]
+                if need > avail and steps_left > 8:
+                    fit = int(max(8, (avail - evals_left * timing["eval_s"]) / self.t_per_step * 0.95))
+                    new_total = step + min(steps_left, fit)
+                    if new_total < planned["total"]:
+                        planned["total"] = new_total
+                        wsd.decay_start = min(wsd.decay_start, int(new_total * 0.72))
+                        wsd.decay_len = max(1, new_total - wsd.decay_start)
+                        log(f"replan: evals cost {timing['eval_s']:.0f}s each -> total={new_total} "
+                            f"decay@{wsd.decay_start}")
             maybe_pool(trainer.model, loss)
             if loss < best["loss"] * 0.999:
                 # save every genuine improvement (a 3B save is ~10s; the old
@@ -903,7 +930,20 @@ def main() -> None:
         raw_loss = eval_now()
         candidates["raw"] = (raw_loss, raw_state)
 
-    have_budget = time.time() < args.end_ts - save_margin
+    # save_margin IS the final phase's budget: training stops at end_ts - save_margin, so the old
+    # test `now < end_ts - save_margin` was false by construction on every clock-bound run and
+    # silently skipped EMA and soup. Budget each candidate by its measured cost instead.
+    _eval_s = timing["eval_s"] or 30.0
+    _export_reserve = max(60.0, 3.0 * (timing["export_s"] or 20.0))
+
+    # main.run() kills this process AT end_ts, so the final export must finish with slack: a kill
+    # mid-save leaves a half-written submission (the smoke run without it ended 3 s from end_ts)
+    _slack = 90.0
+
+    def budget_for(n_evals):
+        return time.time() + n_evals * _eval_s + _export_reserve + _slack < args.end_ts
+
+    have_budget = budget_for(1)
     if ema_enabled and ema and have_budget:
         load_weights(ema)
         candidates["ema"] = (eval_now(), {n: t.clone() for n, t in ema.items()})
@@ -924,12 +964,19 @@ def main() -> None:
         else:
             log("soup: EMA key set does not match the pool; not adding")
 
+    have_budget = budget_for(1)
     if soup_disk and len(soup_slots) >= 2 and have_budget:
         # materialise the disk slots as the pool (rank 0 holds tensors, others None;
         # the loop structure below is identical on every rank so collectives line up)
         soup_pool = [(l, load_slot_state(d)) for l, d in soup_slots]
         log(f"soup: materialised {len(soup_pool)} disk slots "
             f"(losses {' '.join(f'{l:.5f}' for l, _ in soup_pool)})")
+    have_budget = budget_for(1)
+    if (soup_enabled and len(soup_pool) >= 2 and have_budget and soup_mode != "uniform"
+            and not budget_for(len(soup_pool))):
+        # greedy costs one eval per candidate; the uniform average costs one in total
+        log(f"soup: {len(soup_pool)} greedy evals do not fit the remaining time -> uniform")
+        soup_mode = "uniform"
     if soup_enabled and len(soup_pool) >= 2 and have_budget:
         try:
             def _f32(d):

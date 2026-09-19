@@ -139,6 +139,7 @@ def main() -> None:
     # Set when no further attempt can possibly work (the only stack that could load this model is
     # unavailable). Retrying then just burns the budget the emergency submission needs.
     hopeless = {"stop": False}
+    modern_sft = {"failed": False}   # tuned train_sft on the modern venv already tried and failed
 
     def attempts() -> bool:
         # keep enough tail for a save: 15 min on long tasks, proportionally less on short ones
@@ -181,6 +182,32 @@ def main() -> None:
 
     def one_attempt(attempt: int) -> int:
         if args.task_type in ("InstructTextTask", "ChatTask"):
+            # Standard (non-remote-code) archs that only transformers 5 can load, e.g. lfm2: run OUR
+            # tuned train_sft.py on the modern venv instead of train_chat_modern.py, which was built
+            # for the 35B boss chat task on 4 GPUs (eff batch 8 on one GPU, fixed LR, no soup/EMA/
+            # selection). Measured on the rebuilt live round-1 task 90d361cb (LFM2.5-2.6B, 2 h,
+            # 1xH100): train_sft 0.3268 (would have placed 3rd/15) vs train_chat_modern 0.3557
+            # (12th/15); live winner 0.3256. If this route fails, the next attempt falls back to
+            # train_chat_modern below.
+            if (args.task_type == "InstructTextTask" and plan_mod.needs_modern_stack(info)
+                    and not info.get("remote_code") and not modern_sft["failed"]):
+                mtok = tok_dir.rstrip("/") + "_modern"
+                rc = 0
+                if not os.path.isdir(os.path.join(mtok, "train")):
+                    rc = run([MODERN_PY, os.path.join(SRC, "tok_modern.py"),
+                              "--model-path", model_path, "--data-path", data_path,
+                              "--dataset-type", args.dataset_type, "--seq-len", "4096",
+                              "--out-dir", mtok], end_ts)
+                if rc == 0:
+                    rc = run([MODERN_PY, os.path.join(SRC, "train_sft.py"),
+                              *common, "--tokenized-dir", mtok], end_ts,
+                             {"SN56_USE_SOUP": os.environ.get("SN56_USE_SOUP", "1")})
+                if rc == 0 and submission_ok(out_dir):
+                    return 0
+                modern_sft["failed"] = True
+                print(f"[main] train_sft on the modern stack failed (rc={rc}); "
+                      "falling back to train_chat_modern", flush=True)
+                return rc if rc != 0 else 1
             if plan_mod.needs_modern_stack(info):
                 # custom archs (quasar) can only run on the v5 stack; this covers
                 # both ChatTask lineages and the pre-boss quasar instruct task

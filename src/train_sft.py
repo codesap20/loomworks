@@ -625,7 +625,7 @@ def main() -> None:
     if regime["dist"] == "zero3":
         ds_cfg = os.path.join(os.path.dirname(__file__), "..", "ds_config", "zero3.json")
 
-    targs = TrainingArguments(
+    targs_kw = dict(
         output_dir=os.path.join(paths.WORK_ROOT, "hf_out", args.task_id),
         per_device_train_batch_size=micro_bs,
         per_device_eval_batch_size=max(1, micro_bs),
@@ -657,6 +657,15 @@ def main() -> None:
         remove_unused_columns=False,
         dataloader_num_workers=2,
     )
+    # transformers 5 removed some arguments (group_by_length, length_column_name, ...). This trainer
+    # also runs under the transformers-5 venv for archs 4.51 cannot load (lfm2), so pass only what
+    # the installed version accepts and say what was dropped.
+    import inspect
+    _accepted = set(inspect.signature(TrainingArguments.__init__).parameters)
+    _dropped = sorted(k for k in targs_kw if k not in _accepted)
+    if _dropped:
+        log(f"TrainingArguments: dropping args unknown to this transformers: {_dropped}")
+    targs = TrainingArguments(**{k: v for k, v in targs_kw.items() if k in _accepted})
 
     # Dev metric. HF's eval_loss is token-weighted (long samples dominate); the
     # validator scores the MEAN OF PER-SAMPLE CE and counts per-sample wins.

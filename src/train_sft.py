@@ -340,7 +340,13 @@ def main() -> None:
     elif len(train_ds) < 15_000:
         epoch_cap = 2
     else:
-        epoch_cap = 3
+        # Measured on both rebuilt live round-1 tasks (1 h, 1xH100, full budget): the 3-epoch cap,
+        # not the clock or the early-stop, was what ended the run, and it left ~20 of 57 min
+        # unused. Raising it to 6 is neutral-to-better on a clean base (task 87c51c39, 28k rows:
+        # 1.3287 vs 1.3353) and a clear win on an augmented one (task 067761fe, 19k rows: 1.0341
+        # vs 1.0553; 12 epochs adds nothing beyond 6). The overfitting early-stop below is what
+        # actually stops these runs now.
+        epoch_cap = 6
     epoch_cap = int(os.environ.get("SN56_EPOCH_CAP") or epoch_cap)
     lr_mult = float(os.environ.get("SN56_LR_MULT") or 1.0)
     peak_lr *= lr_mult
@@ -459,7 +465,11 @@ def main() -> None:
     if regime["adapter"] is None and not soup_disk_default(info["params"]):
         # bf16 CPU snapshots of every trainable: 4 of them for a 7B full-ft is ~55 GiB of host RAM
         # on top of ema/raw/fp32 copies, and a host OOM kill loses the task outright.
-        soup_k = 4 if (info["params"] or 0) <= 3e9 else 2 if (info["params"] or 0) <= 8e9 else 1
+        # 8 snapshots measured better than 4 on both rebuilt live tasks (0.5B clean: 1.3238 vs
+        # 1.3287; 1.2B augmented: 1.0298 vs 1.0341, together with 24 evals/run). Kept to <=1.5B:
+        # 8 bf16 CPU copies of a 3B model is ~48 GiB of host RAM.
+        _p = info["params"] or 0
+        soup_k = 8 if _p <= 1.5e9 else 4 if _p <= 3e9 else 2 if _p <= 8e9 else 1
     # sweep-only: a bigger pool is allowed for small models; the RAM guard above still
     # caps anything over 3B, where 4 bf16 snapshots already risk a host OOM kill.
     _k_env = int(os.environ.get("SN56_SOUP_K") or 0)
@@ -471,7 +481,11 @@ def main() -> None:
     soup_mode = os.environ.get("SN56_SOUP_MODE", "greedy")
     # evals per run and the early-stop patience move together: at 2x the eval
     # density, 3 stale evals is half as much training as before, so scale it.
-    evals_per_run = int(os.environ.get("SN56_EVALS_PER_RUN") or 12)
+    # 24 evals/run for small models: more (and less correlated) soup candidates and a finer
+    # early-stop, for ~10 s per eval. Measured together with soup_k 8 on both live tasks (above).
+    # Larger models keep 12: their evals are slow enough to eat real training time.
+    evals_per_run = int(os.environ.get("SN56_EVALS_PER_RUN")
+                        or (24 if (info["params"] or 0) <= 3e9 else 12))
     stale_patience = max(3, round(3 * evals_per_run / 12))
     # sweep-only: raise to let a cool-LR run keep training past the first dev bump
     stale_patience = int(os.environ.get("SN56_STALE_PATIENCE") or stale_patience)

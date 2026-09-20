@@ -179,11 +179,7 @@ def main() -> None:
         peak_lr = min(2.5e-4, peak_lr * 5)
 
     # ---- model ------------------------------------------------------------ #
-    attn_impl = "flash_attention_2"
-    try:
-        import flash_attn  # noqa: F401
-    except Exception:
-        attn_impl = "sdpa"
+    attn_impl = plan_mod.attn_impl_for(args.model_path)
 
     def load_base():
         try:

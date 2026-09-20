@@ -191,3 +191,33 @@ def micro_batch_for(params: float | None, seq_len: int, gpu_free_gib: float,
     room = max(gpu_free_gib - weight_overhead - 6, per_sample_gib)
     mb = int(room / per_sample_gib)
     return max(1, min(mb, 64))
+
+
+def attn_impl_for(model_path: str, prefer: str = "flash_attention_2") -> str:
+    """Attention backend this model can actually use.
+
+    flash-attention-2 cannot do ALiBi: transformers raises ValueError("`alibi` is not supported
+    when `use_flash_attn` is True") while BUILDING the model, so the load itself fails. Measured
+    2026-09-20 in the container on this tournament's real GRPO task (tiiuae/falcon-rw-1b): all
+    five attempts died there and the task fell back to a jittered base, i.e. a forfeit. BLOOM and
+    MPT are in the same family. Callers should still keep an sdpa retry around the load.
+    """
+    try:
+        import flash_attn  # noqa: F401
+    except Exception:
+        return "sdpa"
+    try:
+        with open(os.path.join(model_path, "config.json")) as fh:
+            cfg = json.load(fh)
+        if not isinstance(cfg, dict):
+            return prefer
+        if cfg.get("alibi") or (cfg.get("attn_config") or {}).get("alibi"):
+            return "sdpa"
+        if str(cfg.get("position_embedding_type") or "").lower() == "alibi":
+            return "sdpa"
+        for sub in ("text_config", "language_config"):
+            if isinstance(cfg.get(sub), dict) and cfg[sub].get("alibi"):
+                return "sdpa"
+    except Exception:
+        pass
+    return prefer

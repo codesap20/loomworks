@@ -134,13 +134,19 @@ def main() -> None:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    attn = "flash_attention_2"
-    try:
-        import flash_attn  # noqa: F401
-    except Exception:
-        attn = "sdpa"
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path, torch_dtype=torch.bfloat16, attn_implementation=attn)
+    attn = plan_mod.attn_impl_for(args.model_path)
+
+    def _load_base(path=None):
+        p_ = path or args.model_path
+        try:
+            return AutoModelForCausalLM.from_pretrained(
+                p_, torch_dtype=torch.bfloat16, attn_implementation=attn)
+        except Exception as exc:                      # e.g. an arch flash-attn cannot build
+            log(f"{attn} load failed ({type(exc).__name__}: {exc}); retrying with sdpa")
+            return AutoModelForCausalLM.from_pretrained(
+                p_, torch_dtype=torch.bfloat16, attn_implementation="sdpa")
+
+    model = _load_base()
     model.config.use_cache = False
 
     peft_config = None
@@ -151,8 +157,7 @@ def main() -> None:
                                  target_modules="all-linear", task_type="CAUSAL_LM")
         # TRL uses the disabled adapter as an implicit reference == base model
     else:
-        ref_model = AutoModelForCausalLM.from_pretrained(
-            args.model_path, torch_dtype=torch.bfloat16, attn_implementation=attn)
+        ref_model = _load_base()
 
     # length budget from a quick tokenization pass over a sample
     sample = train_rows[: min(200, len(train_rows))]

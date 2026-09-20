@@ -147,6 +147,34 @@ def main() -> None:
                    if pb < 5 else 3.5e-5 if pb < 9 else 1.0e-4 if pb < 15 else 8.0e-5)
     else:
         peak_lr = plan_mod.sft_lr(info["params"])
+
+    # DATA-DRIVEN LR. Measured 2026-09-19 on three rebuilt live tasks plus a 2x2 model x data
+    # cross: the best ABSOLUTE LR is a property of the DATA, not of the model. Both Qwen-0.5B and
+    # Llama-1.2B agree per dataset (task1 ~3.8-4.8e-5, task2 ~6-7.5e-5), and the size table's
+    # opposite ordering (a higher LR for the SMALLER model) is what made it look like a model
+    # effect. Across tasks the optimum tracks supervised tokens per example:
+    #     task2 GossipCop  30/ex  -> ~7.0e-5     (x0.5 1.3382, x1.0 1.1575 on Qwen)
+    #     task1 indic     133-208 -> ~4.3e-5     (Qwen x0.5 1.2949 vs x1.0 1.3238)
+    #     LFM MathFusionQA  534   -> ~3.2e-5     (x0.5 0.3321, x1.0 0.3268, x1.5 0.3425)
+    # lr = 1.72e-4 * m^-0.27 fits all three and predicts the winning multiplier in all four cross
+    # combinations. Kept within a factor of the size table, which still carries what we know about
+    # models far outside this 0.5-2.7B range, and off for LoRA/KL (different objectives, untested).
+    _lr_rule = os.environ.get("SN56_LR_RULE", "tokens")
+    if _lr_rule == "tokens" and not lora and not use_kl:
+        try:
+            _n = min(len(train_ds), 2000)
+            _step = max(1, len(train_ds) // _n)
+            _sup = [sum(1 for x in train_ds[i]["labels"] if x != -100)
+                    for i in range(0, len(train_ds), _step)][:_n]
+            _m = max(1.0, sum(_sup) / max(1, len(_sup)))
+            _pred = 1.72e-4 * _m ** -0.27
+            _lr = min(max(_pred, 0.5 * peak_lr), 1.6 * peak_lr)
+            log(f"lr rule: {_m:.0f} supervised tokens/example -> {_pred:.2e} "
+                f"(table {peak_lr:.2e}, using {_lr:.2e})")
+            peak_lr = _lr
+        except Exception as exc:
+            log(f"lr rule failed ({type(exc).__name__}: {exc}); table LR {peak_lr:.2e}")
+
     if lora:
         peak_lr = min(2.5e-4, peak_lr * 5)
 
@@ -725,7 +753,40 @@ def main() -> None:
     # Aligning the SELECTION metric (dev_metric below) DID pay; aligning the loss did not.
     loss_mode = os.environ.get("SN56_LOSS", "tokw")
 
+    # EMBEDDING LR. On the live indic-instruct task the whole gap to the round winner is one
+    # script: Devanagari 0.876 vs their 0.822 (n=501) while we BEAT them on Latin (1.699 vs
+    # 1.725, n=494), and the gap grows with output length (>512 supervised tokens: +0.056).
+    # Their weights show the same shape as ours but a 1.3x larger embedding delta (0.0862 vs
+    # 0.067 relative). Indic text fragments into tokens that pretraining barely touched, so those
+    # embedding rows need to move further than the rest of the network. SN56_EMBED_LR_MULT
+    # scales the LR of the embedding/lm_head group only.
+    embed_lr_mult = float(os.environ.get("SN56_EMBED_LR_MULT") or 1.0)
+    _EMBED_HINTS = ("embed_tokens", "embed_in", "wte", "word_embeddings", "lm_head", "shared")
+
     class SftTrainer(trainer_cls):
+        def create_optimizer(self):
+            if self.optimizer is not None or embed_lr_mult == 1.0:
+                return super().create_optimizer()
+            decay_names = set(self.get_decay_parameter_names(self.model))
+            groups = {}
+            for n, p_ in self.model.named_parameters():
+                if not p_.requires_grad:
+                    continue
+                is_emb = any(h in n for h in _EMBED_HINTS)
+                key = (is_emb, n in decay_names)
+                groups.setdefault(key, []).append(p_)
+            cls_, kwargs = type(self).get_optimizer_cls_and_kwargs(self.args)
+            kwargs.pop("params", None)
+            param_groups = [{"params": ps,
+                             "lr": self.args.learning_rate * (embed_lr_mult if is_emb else 1.0),
+                             "weight_decay": self.args.weight_decay if dec else 0.0}
+                            for (is_emb, dec), ps in groups.items()]
+            self.optimizer = cls_(param_groups, **{k: v for k, v in kwargs.items()
+                                                   if k not in ("lr", "weight_decay")})
+            n_emb = sum(len(ps) for (is_emb, _), ps in groups.items() if is_emb)
+            log(f"optimizer: {n_emb} embedding tensors at lr x{embed_lr_mult}")
+            return self.optimizer
+
         def compute_loss(self, model, inputs, return_outputs=False, **kw):
             # KL-weighted tasks keep KlTrainer's objective: the validator adds its own KL
             # penalty there and the challenger must not be worse once it is applied, so

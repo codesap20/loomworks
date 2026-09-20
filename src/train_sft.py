@@ -256,37 +256,76 @@ def main() -> None:
     # seq 4096 and the first backward asked for 13.9 GiB it did not have. Live, that costs a whole
     # attempt (round-1 task 067761fe burned 4m47s the same way). One forward+backward at the real
     # shape, with the optimizer states it will later allocate held aside, settles it in seconds.
+    use_ckpt = (info["params"] or 0) > 2.5e9
     if (os.environ.get("SN56_MEM_PROBE", "1") == "1" and torch.cuda.is_available()
             and regime["dist"] in ("single", "single-offload")):
-        _probe_len = int(min(seq_len, max(256, meta.get("len_p99", seq_len))))
+        # Probe with the SAME gradient-checkpointing setting training will use, or the probe
+        # measures a much larger footprint than the real run: on LFM2.5-2.6B it cut micro 3 -> 1
+        # (3x the steps) for runs that had been training fine at 3. When the planned batch does
+        # not fit, turning checkpointing ON is cheaper than halving the batch, so try that first.
+        _probe_len = int(min(seq_len, max(256, meta.get("len_max", seq_len))))
         _trainable = sum(p_.numel() for p_ in model.parameters() if p_.requires_grad)
         _vocab = info.get("vocab") or 32000
-        while micro_bs > 1:
+
+        def _set_ckpt(on):
+            try:
+                if on:
+                    model.config.use_cache = False
+                    model.gradient_checkpointing_enable(
+                        gradient_checkpointing_kwargs={"use_reentrant": False})
+                else:
+                    model.gradient_checkpointing_disable()
+            except Exception:
+                pass
+
+        def _fits():
             reserve = None
             try:
                 if next(model.parameters()).device.type != "cuda":
                     model.cuda()
                 torch.cuda.empty_cache()
-                # AdamW keeps two fp32 moments per trainable parameter; they are not allocated
-                # until the first step, so the probe must not count that memory as free
+                # AdamW keeps two fp32 moments per trainable parameter, allocated at the first
+                # step; the probe must not count that memory as free
                 reserve = torch.empty(int(_trainable * 8), dtype=torch.uint8, device="cuda")
                 ids = torch.randint(0, _vocab, (micro_bs, _probe_len), device="cuda")
-                labels = ids.clone()
-                out = model(input_ids=ids, attention_mask=torch.ones_like(ids), labels=labels)
+                out = model(input_ids=ids, attention_mask=torch.ones_like(ids), labels=ids.clone())
                 out.loss.backward()
-                model.zero_grad(set_to_none=True)
-                del out, ids, labels
-                break
+                del out, ids
+                return True
             except torch.cuda.OutOfMemoryError:
-                micro_bs = max(1, micro_bs // 2)
-                log(f"mem probe: OOM at the planned micro-batch -> {micro_bs}")
+                return False
             except Exception as exc:
                 log(f"mem probe skipped ({type(exc).__name__}: {exc})")
-                break
+                return True
             finally:
                 del reserve
                 model.zero_grad(set_to_none=True)
                 torch.cuda.empty_cache()
+
+        _set_ckpt(use_ckpt)
+        while True:
+            if _fits():
+                break
+            if not use_ckpt:
+                use_ckpt = True
+                _set_ckpt(True)
+                log("mem probe: planned micro-batch does not fit -> gradient checkpointing on")
+                continue
+            if micro_bs <= 1:
+                log("mem probe: still tight at micro-batch 1; going with it")
+                break
+            micro_bs = max(1, micro_bs // 2)
+            log(f"mem probe: OOM -> micro-batch {micro_bs}")
+        # if the batch also came down, checkpointing may no longer be needed - prefer the speed
+        if use_ckpt and (info["params"] or 0) <= 2.5e9:
+            use_ckpt = False
+            _set_ckpt(False)
+            if not _fits():
+                use_ckpt = True
+                log("mem probe: keeping gradient checkpointing on")
+            else:
+                log(f"mem probe: micro-batch {micro_bs} fits without checkpointing")
+        _set_ckpt(False)      # Trainer re-enables it from TrainingArguments
 
     world = max(1, args.num_gpus)
     # Tokens per update, not sequences, is what the field's recipes maximise: rank 4 on the live
@@ -424,6 +463,7 @@ def main() -> None:
     save_margin = int(os.environ.get("SN56_SAVE_MARGIN") or save_margin)
     # measured during the run: seconds per dev eval and per export (trainer.save_model)
     timing = {"eval_s": None, "export_s": None}
+    budget_t0 = time.time()
 
     wsd = WsdPlan(warmup_steps=max(4, int(0.02 * steps_per_epoch * 2)))
     planned = {"total": steps_per_epoch * epoch_cap}
@@ -735,7 +775,7 @@ def main() -> None:
         warmup_ratio=(0.03 if champ_sched else 0.0),
         bf16=True,
         tf32=True,
-        gradient_checkpointing=(info["params"] or 0) > 2.5e9,
+        gradient_checkpointing=use_ckpt,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         eval_strategy="steps",
         eval_steps=max(20, steps_per_epoch // 4),
@@ -908,13 +948,46 @@ def main() -> None:
         targs.use_liger_kernel = False
         trainer = _build_trainer()
 
-    try:
-        trainer.train()
-    except torch.cuda.OutOfMemoryError:
-        state.setdefault("sft", {})["micro_batch"] = max(1, micro_bs // 2)
-        with open(args.state_file, "w") as f:
-            json.dump(state, f)
-        raise
+    def _restore(st):
+        with torch.no_grad():
+            for n_, p_ in model.named_parameters():
+                if p_.requires_grad and n_ in st:
+                    p_.copy_(st[n_].to(p_.device, p_.dtype))
+
+    # SECOND RUN INTO THE SAME SOUP. These tasks are ended by the overfitting early-stop, not by
+    # the clock: the live-task arms stop at ~30 min of a 57 min budget and hand the rest back.
+    # Restarting from the ORIGINAL weights with a different data order and pooling both runs'
+    # checkpoints costs nothing we were using, and independent fine-tunes of the same base average
+    # well (model soups). Off for zero3/disk-soup, where snapshots are sharded or on disk.
+    rerun_max = int(os.environ.get("SN56_RERUN_MAX") or 1)   # >1 enables; default off until measured
+    rerun_ok = (soup_enabled and not soup_disk and regime["dist"] in ("single", "single-offload")
+                and (info["params"] or 0) <= 3e9)
+    base_state = snapshot_trainables(model) if (rerun_ok and rerun_max > 1) else None
+
+    cycle = 1
+    while True:
+        try:
+            trainer.train()
+        except torch.cuda.OutOfMemoryError:
+            state.setdefault("sft", {})["micro_batch"] = max(1, micro_bs // 2)
+            with open(args.state_file, "w") as f:
+                json.dump(state, f)
+            raise
+        if base_state is None or cycle >= rerun_max:
+            break
+        left = args.end_ts - save_margin - time.time()
+        if left < max(600.0, 0.45 * (args.end_ts - budget_t0)):
+            log(f"rerun: {left / 60:.0f} min left, not enough for another run")
+            break
+        cycle += 1
+        log(f"rerun: {left / 60:.0f} min left -> run {cycle} from the original weights "
+            f"(soup pool has {len(soup_pool)})")
+        _restore(base_state)
+        ema.clear()
+        best.update({"loss": float("inf"), "stale": 0, "state": None, "saved_at": 0.0})
+        planned["total"] = steps_per_epoch * epoch_cap
+        targs.seed = 1337 + cycle          # different shuffle, same data
+        trainer = _build_trainer()
 
     # ---- final selection: best-on-disk vs raw vs EMA vs greedy soup -------- #
     final_phase["on"] = True

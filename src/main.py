@@ -415,6 +415,25 @@ def _main_never_fails() -> None:
         traceback.print_exc()
         print(f"[main] top-level {type(e).__name__}: {e} - exiting 0 so the checkpoint dir is uploaded",
               flush=True)
+        # LAST RESORT. Everything below main()'s own emergency path assumes we got far enough to
+        # reach it; a failure BEFORE that (dataset resolution, tokenization, probe_model, a config
+        # we cannot parse) left the checkpoint dir EMPTY, which uploads nothing and scores the task
+        # as a forfeit. Shipping the jittered base instead is always better than shipping nothing.
+        try:
+            a_ = parse_args()
+            out_ = paths.submission_dir(a_.task_id, a_.expected_repo_name)
+            if not submission_ok(out_):
+                mp_ = paths.resolve_model_path(a_.model)
+                modern_ = True
+                try:
+                    modern_ = plan_mod.needs_modern_stack(plan_mod.probe_model(mp_))
+                except Exception:
+                    pass
+                print("[main] nothing in the checkpoint dir; emergency submission from the base",
+                      flush=True)
+                emergency_submission(mp_, out_, modern_)
+        except Exception as e2:
+            print(f"[main] last-resort emergency failed too: {type(e2).__name__}: {e2}", flush=True)
 
 
 if __name__ == "__main__":

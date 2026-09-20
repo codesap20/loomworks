@@ -248,6 +248,46 @@ def main() -> None:
         vocab=info.get("vocab"), fused_ce=use_liger)
     if packing:
         micro_bs = max(1, micro_bs // 2)  # flattened rows are mb x len long
+
+    # PRE-FLIGHT MEMORY PROBE. micro_batch_for() is an estimate, and it reads LoRA as cheap
+    # (2.5 bytes/param of overhead) when what actually dominates is ACTIVATIONS, which an adapter
+    # does not shrink at all — below 2.5B params gradient checkpointing is off, so every layer's
+    # activations are kept. Measured 2026-09-20: it chose micro 6 for a LoRA run on Qwen-0.5B at
+    # seq 4096 and the first backward asked for 13.9 GiB it did not have. Live, that costs a whole
+    # attempt (round-1 task 067761fe burned 4m47s the same way). One forward+backward at the real
+    # shape, with the optimizer states it will later allocate held aside, settles it in seconds.
+    if (os.environ.get("SN56_MEM_PROBE", "1") == "1" and torch.cuda.is_available()
+            and regime["dist"] in ("single", "single-offload")):
+        _probe_len = int(min(seq_len, max(256, meta.get("len_p99", seq_len))))
+        _trainable = sum(p_.numel() for p_ in model.parameters() if p_.requires_grad)
+        _vocab = info.get("vocab") or 32000
+        while micro_bs > 1:
+            reserve = None
+            try:
+                if next(model.parameters()).device.type != "cuda":
+                    model.cuda()
+                torch.cuda.empty_cache()
+                # AdamW keeps two fp32 moments per trainable parameter; they are not allocated
+                # until the first step, so the probe must not count that memory as free
+                reserve = torch.empty(int(_trainable * 8), dtype=torch.uint8, device="cuda")
+                ids = torch.randint(0, _vocab, (micro_bs, _probe_len), device="cuda")
+                labels = ids.clone()
+                out = model(input_ids=ids, attention_mask=torch.ones_like(ids), labels=labels)
+                out.loss.backward()
+                model.zero_grad(set_to_none=True)
+                del out, ids, labels
+                break
+            except torch.cuda.OutOfMemoryError:
+                micro_bs = max(1, micro_bs // 2)
+                log(f"mem probe: OOM at the planned micro-batch -> {micro_bs}")
+            except Exception as exc:
+                log(f"mem probe skipped ({type(exc).__name__}: {exc})")
+                break
+            finally:
+                del reserve
+                model.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
+
     world = max(1, args.num_gpus)
     # Tokens per update, not sequences, is what the field's recipes maximise: rank 4 on the live
     # 0.5B task ran batch 60 of PACKED 2031-token sequences (~120k tokens/update) against our 65

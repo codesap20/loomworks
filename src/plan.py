@@ -66,27 +66,28 @@ def needs_modern_stack(model_info: dict) -> bool:
     """True when the legacy (transformers 4.51.3) stack cannot load this model at all.
 
     Three cases:
-      * quasar_* custom archs and anything with an auto_map (remote code);
-      * any model_type the INSTALLED transformers does not know. This is the common one and it cost
-        us the 2026-09-14 tournament: task 90d361cb on LiquidAI/LFM2.5-2.6B is plain `lfm2`, a
-        natively-supported arch in newer transformers but absent from 4.51.3, so every attempt died
-        with KeyError: 'lfm2' (and the emergency submission, also on the legacy stack, with it).
-        New architectures land in the model pool constantly, so ask the library instead of
-        maintaining a list.
+      * quasar_* custom archs, and anything whose model_type the INSTALLED transformers does not
+        know. The latter cost us the 2026-09-14 tournament: task 90d361cb on LiquidAI/LFM2.5-2.6B
+        is plain `lfm2`, a natively-supported arch in newer transformers but absent from 4.51.3,
+        so every attempt died with KeyError: 'lfm2' (and the emergency submission with it). New
+        architectures land in the model pool constantly, so ask the library instead of keeping a list.
+
+    A repo that SHIPS remote code is not by itself a reason: tiiuae/falcon-rw-1b carries an
+    auto_map and configuration_falcon.py, but its model_type `falcon` is native to 4.51.3, which
+    loads it as FalconForCausalLM (our trainers never pass trust_remote_code). Treating auto_map as
+    disqualifying sent the live GRPO task straight to the emergency fallback - a forfeited task -
+    which is exactly what the container test caught on 2026-09-20.
     """
     mt = (model_info.get("model_type") or "").lower()
     if mt.startswith("quasar"):
         return True
-    if model_info.get("remote_code"):
+    if not mt:
+        return True       # cannot tell -> assume the legacy stack cannot load it (lfm2 lesson)
+    try:
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
+        return mt not in CONFIG_MAPPING_NAMES
+    except Exception:
         return True
-    if mt:
-        try:
-            from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
-            if mt not in CONFIG_MAPPING_NAMES:
-                return True
-        except Exception:
-            return True   # cannot tell -> assume the legacy stack cannot load it (lfm2 lesson)
-    return False
 
 
 def sft_lr(params: float | None) -> float:

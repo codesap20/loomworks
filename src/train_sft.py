@@ -279,7 +279,7 @@ def main() -> None:
             except Exception:
                 pass
 
-        def _fits():
+        def _fits(length=None):
             reserve = None
             try:
                 if next(model.parameters()).device.type != "cuda":
@@ -288,7 +288,7 @@ def main() -> None:
                 # the optimizer moments are allocated at the first step; the probe must not count
                 # that memory as free
                 reserve = torch.empty(int(_opt_bytes), dtype=torch.uint8, device="cuda")
-                ids = torch.randint(0, _vocab, (micro_bs, _probe_len), device="cuda")
+                ids = torch.randint(0, _vocab, (micro_bs, length or _probe_len), device="cuda")
                 out = model(input_ids=ids, attention_mask=torch.ones_like(ids), labels=ids.clone())
                 out.loss.backward()
                 del out, ids
@@ -304,9 +304,30 @@ def main() -> None:
                 torch.cuda.empty_cache()
 
         _set_ckpt(use_ckpt)
+        len_cap = None
         while True:
             if _fits():
                 break
+            # The worst case is micro x len_max because the collator pads to the longest row in a
+            # batch - but on most tasks rows that long are a sliver (LFM2.5 task: p99 1619, max
+            # 4096), which is why five 2 h runs at micro 3 never met it. Cap training rows at the
+            # longest length the planned batch fits instead of halving the batch for everyone: a
+            # few tail rows lose their last tokens, every step keeps the full batch, and the OOM
+            # becomes impossible rather than unlikely. Only while the cap stays above p99.
+            if use_ckpt and len_cap is None:
+                _floor = int(min(_probe_len, max(512, meta.get("len_p99", _probe_len))))
+                for _frac in (0.85, 0.7, 0.55, 0.4):
+                    _L = int(_probe_len * _frac)
+                    if _L < _floor:
+                        break
+                    if _fits(_L):
+                        len_cap = _L
+                        break
+                if len_cap:
+                    log(f"mem probe: micro-batch {micro_bs} fits up to {len_cap} tokens "
+                        f"-> capping training rows there (p99 {meta.get('len_p99')}, max {_probe_len})")
+                    break
+                len_cap = 0          # tried; fall through to halving
             if not use_ckpt:
                 use_ckpt = True
                 _set_ckpt(True)
@@ -321,12 +342,28 @@ def main() -> None:
         if use_ckpt and (info["params"] or 0) <= 2.5e9:
             use_ckpt = False
             _set_ckpt(False)
-            if not _fits():
+            if not _fits(len_cap or None):
                 use_ckpt = True
                 log("mem probe: keeping gradient checkpointing on")
             else:
                 log(f"mem probe: micro-batch {micro_bs} fits without checkpointing")
         _set_ckpt(False)      # Trainer re-enables it from TrainingArguments
+        if len_cap:
+            _n_long = sum(1 for x in train_ds["length"] if x > len_cap)
+
+            def _cut(r):
+                if len(r["input_ids"]) <= len_cap:
+                    return r
+                out = dict(r)
+                for k in ("input_ids", "labels", "attention_mask"):
+                    if k in out and out[k] is not None:
+                        out[k] = out[k][:len_cap]
+                out["length"] = len_cap
+                return out
+
+            train_ds = train_ds.map(_cut)
+            train_ds = train_ds.filter(lambda r: any(x != -100 for x in r["labels"][1:]))
+            log(f"mem probe: {_n_long} of {len(train_ds)} training rows truncated to {len_cap} tokens")
 
     world = max(1, args.num_gpus)
     # Tokens per update, not sequences, is what the field's recipes maximise: rank 4 on the live

@@ -260,7 +260,12 @@ def main() -> None:
         # (3x the steps) for runs that had been training fine at 3. When the planned batch does
         # not fit, turning checkpointing ON is cheaper than halving the batch, so try that first.
         _probe_len = int(min(seq_len, max(256, meta.get("len_max", seq_len))))
-        _trainable = sum(p_.numel() for p_ in model.parameters() if p_.requires_grad)
+        # AdamW keeps exp_avg and exp_avg_sq in the PARAMETER dtype (measured on this stack, fused
+        # and unfused): 4 bytes/param for our bf16 weights, not 8. Reserving 8 made the probe
+        # refuse micro 3 on LFM2.5-2.6B (-> micro 1, half the steps, 0.3309 vs 0.3268) for a batch
+        # five 2 h runs had trained at without a single OOM.
+        _opt_bytes = sum(p_.numel() * 2 * p_.element_size()
+                         for p_ in model.parameters() if p_.requires_grad)
         _vocab = info.get("vocab") or 32000
 
         def _set_ckpt(on):
@@ -280,9 +285,9 @@ def main() -> None:
                 if next(model.parameters()).device.type != "cuda":
                     model.cuda()
                 torch.cuda.empty_cache()
-                # AdamW keeps two fp32 moments per trainable parameter, allocated at the first
-                # step; the probe must not count that memory as free
-                reserve = torch.empty(int(_trainable * 8), dtype=torch.uint8, device="cuda")
+                # the optimizer moments are allocated at the first step; the probe must not count
+                # that memory as free
+                reserve = torch.empty(int(_opt_bytes), dtype=torch.uint8, device="cuda")
                 ids = torch.randint(0, _vocab, (micro_bs, _probe_len), device="cuda")
                 out = model(input_ids=ids, attention_mask=torch.ones_like(ids), labels=ids.clone())
                 out.loss.backward()

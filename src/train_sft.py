@@ -575,7 +575,10 @@ def main() -> None:
         # 1.3287; 1.2B augmented: 1.0298 vs 1.0341, together with 24 evals/run). Kept to <=1.5B:
         # 8 bf16 CPU copies of a 3B model is ~48 GiB of host RAM.
         _p = info["params"] or 0
-        soup_k = 8 if _p <= 1.5e9 else 4 if _p <= 3e9 else 2 if _p <= 8e9 else 1
+        # 12 snapshots for <=1.5B (measured at the shipping defaults, unthrottled): Llama-1.2B
+        # 1.0004 -> 0.9816, the best score on that task by any arm; Qwen-0.5B 1.2835 -> 1.2789.
+        # 12 bf16 copies of 1.5B params is ~36 GiB of host RAM, the ceiling we allow.
+        soup_k = 12 if _p <= 1.5e9 else 4 if _p <= 3e9 else 2 if _p <= 8e9 else 1
     # sweep-only: a bigger pool is allowed for small models; the RAM guard above still
     # caps anything over 3B, where 4 bf16 snapshots already risk a host OOM kill.
     _k_env = int(os.environ.get("SN56_SOUP_K") or 0)
@@ -590,8 +593,11 @@ def main() -> None:
     # 24 evals/run for small models: more (and less correlated) soup candidates and a finer
     # early-stop, for ~10 s per eval. Measured together with soup_k 8 on both live tasks (above).
     # Larger models keep 12: their evals are slow enough to eat real training time.
+    # 36 evals/run for <=1.5B (feeds the 12-snapshot soup; an eval there costs ~4-7 s), 24 up to
+    # 3B, 12 above - there an eval is slow enough to eat real training time.
+    _pe = info["params"] or 0
     evals_per_run = int(os.environ.get("SN56_EVALS_PER_RUN")
-                        or (24 if (info["params"] or 0) <= 3e9 else 12))
+                        or (36 if _pe <= 1.5e9 else 24 if _pe <= 3e9 else 12))
     stale_patience = max(3, round(3 * evals_per_run / 12))
     # sweep-only: raise to let a cool-LR run keep training past the first dev bump
     stale_patience = int(os.environ.get("SN56_STALE_PATIENCE") or stale_patience)
